@@ -81,7 +81,8 @@
 typedef struct Profile {
     WCHAR folder[FOLDER_CCH];  /* "Claude" (stock) or "Claude-<name>": the stable id */
     WCHAR name[LABEL_CCH];     /* display name, editable */
-    WCHAR dataDir[MAX_PATH];   /* %APPDATA%\<folder> */
+    WCHAR dataDir[MAX_PATH];   /* %APPDATA%\<folder>, as Claude sees it */
+    WCHAR storageDir[MAX_PATH]; /* file access outside the package; empty when unresolved */
     int   color;               /* palette index */
     BOOL  isStock;             /* the folder the regular Claude icon opens */
     BOOL  running;
@@ -160,6 +161,7 @@ void         Core_ProfileAumid(const WCHAR *folder, WCHAR *out, size_t cch);
 void         Core_ShortcutFileName(const WCHAR *label, int copy, WCHAR *out, size_t cch);
 ULONGLONG    Core_SystemTimeTicks(const SYSTEMTIME *st);
 BOOL         Core_PathUnder(const WCHAR *path, const WCHAR *dir);
+BOOL         Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch);
 BOOL         Core_SameFatTime(const FILETIME *a, const FILETIME *b);
 BOOL         Core_JsonMember(const char *json, size_t len, const char *key, const char **value, size_t *valueLen);
 BOOL         Core_JsonString(const char *raw, size_t len, WCHAR *out, size_t cch);
@@ -198,6 +200,7 @@ BOOL      Util_InstallExe(WCHAR *out, size_t cch);
 BOOL      Util_StateDir(WCHAR *out, size_t cch);       /* %LOCALAPPDATA%\Claude Desktop Profiles Manager */
 BOOL      Util_FileExists(const WCHAR *path);
 BOOL      Util_DirExists(const WCHAR *path);
+BOOL      Util_ExistingDir(const WCHAR *path, WCHAR *out, size_t cch);
 BOOL      Util_EnsureDir(const WCHAR *path);
 BOOL      Util_RegGetString(HKEY root, const WCHAR *key, const WCHAR *value, WCHAR *out, DWORD cch);
 BOOL      Util_RegSetString(HKEY root, const WCHAR *key, const WCHAR *value, const WCHAR *data);
@@ -228,6 +231,7 @@ int     Claude_TopmostProfile(const ProfileList *list);
 /* ------------------------------------------------------------ profiles.c */
 
 void Profiles_Load(ProfileList *list);
+BOOL Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR *family);
 int  Profiles_Find(const ProfileList *list, const WCHAR *folder);
 int  Profiles_DefaultIndex(const ProfileList *list);
 BOOL Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t folderCch,
@@ -362,7 +366,7 @@ typedef struct SessionSource {         /* what reading one profile's entries fou
     int       elsewhere;               /* SSH, WSL or cloud sessions: their conversation is not on this PC */
     int       pending;                 /* changes waiting for it to close */
     WCHAR     entriesDir[MAX_PATH];    /* claude-code-sessions\<account>\<organization>, when found */
-    WCHAR     scratchDir[MAX_PATH];    /* scratch-workspaces\<account>\<organization>: its "no folder" */
+    WCHAR     scratchDir[MAX_PATH];    /* logical scratch-workspaces\<account>\<organization>: its "no folder" */
 } SessionSource;
 
 typedef struct SessionSet {
@@ -378,9 +382,12 @@ typedef struct SessionSet {
 #define SESSION_PENDING_MAX 256
 
 BOOL         SessionStore_Load(SessionSet *set);
+BOOL         SessionStore_LoadProfiles(SessionSet *set, const ProfileList *profiles);
 void         SessionStore_Free(SessionSet *set);
 BOOL         SessionStore_ProjectsDir(WCHAR *out, size_t cch);
 BOOL         SessionStore_SessionsDir(const Profile *p, WCHAR *out, size_t cch);
+BOOL         SessionStore_WorkingDir(const SessionSet *set, const WCHAR *cwd, WCHAR *out, size_t cch);
+BOOL         SessionStore_WatchDir(const Profile *p, WCHAR *out, size_t cch);
 BOOL         SessionStore_PendingPath(const Profile *p, WCHAR *out, size_t cch);
 int          SessionStore_LoadPending(const Profile *p, PendingEdit *edits, int max);
 const WCHAR *SessionStore_RowTitle(const SessionSet *set, const SessionRow *row);

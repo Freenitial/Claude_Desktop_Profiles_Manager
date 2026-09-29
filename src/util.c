@@ -61,6 +61,24 @@ BOOL Util_DirExists(const WCHAR *path)
     return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+/* The nearest existing directory, including the path itself, for watching
+ * the creation of a missing child without creating any directories. */
+BOOL Util_ExistingDir(const WCHAR *path, WCHAR *out, size_t cch)
+{
+    if (!cch) return FALSE;
+    if (path != out && FAILED(StringCchCopyW(out, cch, path))) return FALSE;
+    while (!Util_DirExists(out)) {
+        WCHAR *slash = wcsrchr(out, L'\\');
+        if (!slash || slash == out || (slash == out + 2 && out[1] == L':' && !slash[1])) {
+            out[0] = 0;
+            return FALSE;
+        }
+        if (slash == out + 2 && out[1] == L':') slash[1] = 0;
+        else *slash = 0;
+    }
+    return TRUE;
+}
+
 BOOL Util_EnsureDir(const WCHAR *path)
 {
     int rc = SHCreateDirectoryExW(NULL, path, NULL);

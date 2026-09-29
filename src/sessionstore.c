@@ -161,7 +161,29 @@ static const Transcript *FindTranscript(const Transcripts *t, const WCHAR *id)
 
 BOOL SessionStore_SessionsDir(const Profile *p, WCHAR *out, size_t cch)
 {
-    return SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" SESSIONS_DIR, p->dataDir));
+    if (!cch) return FALSE;
+    out[0] = 0;
+    return p->storageDir[0] && SUCCEEDED(StringCchPrintfW(out, cch, L"%s\\" SESSIONS_DIR, p->storageDir));
+}
+
+/* Until the entries exist, a notification on their closest existing parent
+ * catches the creation of every missing directory without creating it. */
+BOOL SessionStore_WatchDir(const Profile *p, WCHAR *out, size_t cch)
+{
+    return SessionStore_SessionsDir(p, out, cch) && Util_ExistingDir(out, out, cch);
+}
+
+/* Entries and transcripts retain the paths seen inside Claude's package.
+ * Explorer and file operations need the corresponding path outside it. */
+BOOL SessionStore_WorkingDir(const SessionSet *s, const WCHAR *cwd, WCHAR *out, size_t cch)
+{
+    int p;
+    for (p = 0; p < s->profiles.count; p++) {
+        const Profile *profile = &s->profiles.items[p];
+        if (Core_PathEquals(cwd, profile->dataDir) || Core_PathUnder(cwd, profile->dataDir))
+            return Core_ProfileFilePath(profile, cwd, out, cch);
+    }
+    return SUCCEEDED(StringCchCopyW(out, cch, cwd));
 }
 
 /* The subfolder of `dir` whose local_*.json is the most recent. */
@@ -204,7 +226,9 @@ static BOOL EntriesDir(const Profile *p, WCHAR *out, size_t cch, BOOL *signedIn)
     DWORD len = 0;
     char *json;
     account[0] = 0;
-    if (SUCCEEDED(StringCchPrintfW(config, ARRAYSIZE(config), L"%s\\config.json", p->dataDir)) &&
+    *signedIn = FALSE;
+    if (!p->storageDir[0]) return FALSE;
+    if (SUCCEEDED(StringCchPrintfW(config, ARRAYSIZE(config), L"%s\\config.json", p->storageDir)) &&
         (json = Util_ReadFile(config, RECORD_MAX_BYTES, FALSE, &len)) != NULL) {
         MemberString(json, len, "lastKnownAccountUuid", account, ARRAYSIZE(account));
         HeapFree(GetProcessHeap(), 0, json);
@@ -305,6 +329,24 @@ static void AddEntry(SessionSet *s, int profile, const WCHAR *file, const char *
     }
 }
 
+/* Log a resolved source once per state, not on every transcript notification. */
+static void LogSource(int profile, const Profile *p, const SessionSource *src)
+{
+    static ULONGLONG previous[MAX_PROFILES];
+    ULONGLONG hash = Core_HashBytes(CORE_HASH_START, p->folder, wcslen(p->folder) * sizeof(WCHAR));
+    const WCHAR *reason;
+    hash = Core_HashBytes(hash, p->storageDir, wcslen(p->storageDir) * sizeof(WCHAR));
+    hash = Core_HashBytes(hash, src->entriesDir, wcslen(src->entriesDir) * sizeof(WCHAR));
+    hash = Core_HashBytes(hash, &src->signedIn, sizeof src->signedIn);
+    if (hash == previous[profile]) return;
+    previous[profile] = hash;
+    if (!p->storageDir[0]) reason = L"profile storage could not be resolved";
+    else if (src->found) reason = src->signedIn ? L"account entries resolved" : L"stored entries found without an account in config.json";
+    else if (src->signedIn) reason = L"account known; no session entries folder";
+    else reason = L"no account or entries found; config.json may be missing, unreadable or have no account";
+    Util_Log(L"sessions in %s: data=%s; entries=%s; %s", p->folder, p->storageDir, src->entriesDir, reason);
+}
+
 static void LoadProfileEntries(SessionSet *s, int profile, const Transcripts *t)
 {
     WCHAR pattern[MAX_PATH], path[MAX_PATH];
@@ -315,9 +357,11 @@ static void LoadProfileEntries(SessionSet *s, int profile, const Transcripts *t)
     if (!EntriesDir(p, src->entriesDir, ARRAYSIZE(src->entriesDir), &src->signedIn) ||
         FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\local_*.json", src->entriesDir))) {
         src->entriesDir[0] = 0;
+        LogSource(profile, p, src);
         return;
     }
     src->found = TRUE;
+    LogSource(profile, p, src);
     ScratchDirFor(p, src->entriesDir, src->scratchDir, ARRAYSIZE(src->scratchDir));
     h = FindFirstFileExW(pattern, FindExInfoBasic, &fd, FindExSearchNameMatch, NULL, 0);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -531,12 +575,19 @@ static void GroupRows(SessionSet *s)
 
 BOOL SessionStore_Load(SessionSet *s)
 {
+    ProfileList profiles;
+    Profiles_Load(&profiles);
+    return SessionStore_LoadProfiles(s, &profiles);
+}
+
+BOOL SessionStore_LoadProfiles(SessionSet *s, const ProfileList *profiles)
+{
     WCHAR projects[MAX_PATH];
     Transcripts t;
     int p;
     ZeroMemory(s, sizeof *s);
     ZeroMemory(&t, sizeof t);
-    Profiles_Load(&s->profiles);
+    s->profiles = *profiles;
     s->noTranscripts = !SessionStore_ProjectsDir(projects, ARRAYSIZE(projects)) || !Util_DirExists(projects);
     LoadTranscripts(&t);
     for (p = 0; p < s->profiles.count; p++) LoadProfileEntries(s, p, &t);

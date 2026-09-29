@@ -16,14 +16,54 @@ static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
     StringCchPrintfW(out, cch, REG_PROFILES L"\\%s", folder);
 }
 
+/* A missing stock folder is virtualized by the package. An inaccessible
+ * Roaming folder is not evidence of that absence, so it cannot select a
+ * different data store. Resolving a path never creates a profile folder. */
+BOOL Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR *family)
+{
+    WCHAR parent[MAX_PATH], *slash;
+    DWORD attr, error;
+    size_t n;
+    if (!p) return FALSE;
+    p->storageDir[0] = 0;
+    if (!p->dataDir[0]) return FALSE;
+    if (!p->isStock)
+        return SUCCEEDED(StringCchCopyW(p->storageDir, ARRAYSIZE(p->storageDir), p->dataDir));
+    attr = GetFileAttributesW(p->dataDir);
+    if (attr != INVALID_FILE_ATTRIBUTES) {
+        if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return FALSE;
+        return SUCCEEDED(StringCchCopyW(p->storageDir, ARRAYSIZE(p->storageDir), p->dataDir));
+    }
+    error = GetLastError();
+    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return FALSE;
+    if (FAILED(StringCchCopyW(parent, ARRAYSIZE(parent), p->dataDir))) return FALSE;
+    n = wcslen(parent);
+    while (n > 3 && (parent[n - 1] == L'\\' || parent[n - 1] == L'/')) parent[--n] = 0;
+    slash = wcsrchr(parent, L'\\');
+    if (!slash || slash == parent) return FALSE;
+    *slash = 0;
+    if (!Util_DirExists(parent) || !localAppData || !*localAppData || !family || !*family) return FALSE;
+    if (FAILED(StringCchPrintfW(p->storageDir, ARRAYSIZE(p->storageDir),
+                                L"%s\\Packages\\%s\\LocalCache\\Roaming\\" STOCK_FOLDER, localAppData, family))) {
+        p->storageDir[0] = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isStock)
 {
-    WCHAR key[MAX_PATH];
+    WCHAR key[MAX_PATH], local[MAX_PATH];
+    ClaudePackage pkg;
     DWORD color;
     ZeroMemory(p, sizeof *p);
     StringCchCopyW(p->folder, ARRAYSIZE(p->folder), folder);
-    StringCchPrintfW(p->dataDir, ARRAYSIZE(p->dataDir), L"%s\\%s", appData, folder);
+    if (FAILED(StringCchPrintfW(p->dataDir, ARRAYSIZE(p->dataDir), L"%s\\%s", appData, folder))) p->dataDir[0] = 0;
     p->isStock = isStock;
+    if (isStock && Util_LocalAppData(local, ARRAYSIZE(local)) && Claude_FindPackage(&pkg))
+        Profiles_ResolveStorage(p, local, pkg.family);
+    else
+        Profiles_ResolveStorage(p, NULL, NULL);
     ProfileKey(folder, key, ARRAYSIZE(key));
     if (!Util_RegGetString(HKEY_CURRENT_USER, key, L"Name", p->name, ARRAYSIZE(p->name)) || !p->name[0])
         StringCchCopyW(p->name, ARRAYSIZE(p->name), isStock ? STOCK_DEFAULT_NAME : folder + wcslen(PROFILE_PREFIX));
@@ -270,9 +310,14 @@ void Profiles_CopySettings(const Profile *from, const Profile *to)
 {
     static const char *const desktop[] = { "mcpServers", "isHardwareAccelerationDisabled" };
     static const char *const app[] = { "locale", "userThemeMode" };
-    BOOL a = CopyMembers(from->dataDir, to->dataDir, L"claude_desktop_config.json", desktop, ARRAYSIZE(desktop),
-                         "preferences", "menuBarEnabled");
-    BOOL b = CopyMembers(from->dataDir, to->dataDir, L"config.json", app, ARRAYSIZE(app), NULL, NULL);
+    BOOL a, b;
+    if (!from->storageDir[0] || !to->storageDir[0]) {
+        Util_Log(L"could not copy settings of %s to %s: profile storage is unavailable", from->folder, to->folder);
+        return;
+    }
+    a = CopyMembers(from->storageDir, to->storageDir, L"claude_desktop_config.json", desktop, ARRAYSIZE(desktop),
+                    "preferences", "menuBarEnabled");
+    b = CopyMembers(from->storageDir, to->storageDir, L"config.json", app, ARRAYSIZE(app), NULL, NULL);
     Util_Log(L"copied settings of %s to %s (%d, %d)", from->folder, to->folder, a, b);
 }
 

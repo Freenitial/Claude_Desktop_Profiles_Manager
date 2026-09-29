@@ -317,6 +317,7 @@ BOOL SessionEdit_CopyConversation(const SessionSet *s, int r, int target, WCHAR 
     const SessionRow *row = &s->rows[r];
     const SessionSource *dest = &s->source[target];
     WCHAR cwd[MAX_PATH], dir[MAX_PATH], name[64], to[MAX_PATH], projects[MAX_PATH], *slash;
+    WCHAR sourceFiles[MAX_PATH], targetFiles[MAX_PATH], scratchFiles[MAX_PATH];
     char fromId[80], toId[80], fromCwd[MAX_PATH * 4 + 16], toCwd[MAX_PATH * 4 + 16];
     char q1[MAX_PATH * 3 + 4], q2[MAX_PATH * 3 + 4];
     CoreSwap swaps[2];
@@ -346,7 +347,10 @@ BOOL SessionEdit_CopyConversation(const SessionSet *s, int r, int target, WCHAR 
         GetSystemTime(&today);   /* Claude dates them in UTC */
         Core_ScratchName(&today, random, name, ARRAYSIZE(name));
         if (FAILED(StringCchPrintfW(cwd, ARRAYSIZE(cwd), L"%s\\%s", dest->scratchDir, name)) ||
-            !Util_EnsureDir(dest->scratchDir) || !CopyFolder(row->cwd, cwd)) {
+            !SessionStore_WorkingDir(s, row->cwd, sourceFiles, ARRAYSIZE(sourceFiles)) ||
+            !Core_ProfileFilePath(&s->profiles.items[target], dest->scratchDir, scratchFiles, ARRAYSIZE(scratchFiles)) ||
+            !Core_ProfileFilePath(&s->profiles.items[target], cwd, targetFiles, ARRAYSIZE(targetFiles)) ||
+            !Util_EnsureDir(scratchFiles) || !CopyFolder(sourceFiles, targetFiles)) {
             StringCchCopyW(error, errorCch, L"Its working folder could not be copied.");
             return FALSE;
         }

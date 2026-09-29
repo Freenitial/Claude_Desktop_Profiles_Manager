@@ -340,6 +340,64 @@ static void TestPathsAndTimes(void)
     Check("another minute", !Core_SameFatTime(&t0, &t3));
 }
 
+static void TestProfileFilePaths(void)
+{
+    Profile p;
+    WCHAR out[MAX_PATH], physical[MAX_PATH], large[MAX_PATH];
+    const WCHAR *logical = L"C:\\Users\\X\\AppData\\Roaming\\Claude";
+    const WCHAR *storage = L"C:\\Users\\X\\AppData\\Local\\Packages\\Claude_test\\LocalCache\\Roaming\\Claude";
+    ZeroMemory(&p, sizeof p);
+    StringCchCopyW(p.dataDir, ARRAYSIZE(p.dataDir), logical);
+    StringCchCopyW(p.storageDir, ARRAYSIZE(p.storageDir), storage);
+    StringCchPrintfW(physical, ARRAYSIZE(physical), L"%s\\scratch-workspaces\\a\\b\\work", storage);
+    Check("profile path: logical root resolves", Core_ProfileFilePath(&p, logical, out, ARRAYSIZE(out)) &&
+          wcscmp(out, storage) == 0);
+    Check("profile path: logical descendant resolves", Core_ProfileFilePath(&p,
+          L"C:\\Users\\X\\AppData\\Roaming\\Claude\\scratch-workspaces\\a\\b\\work", out, ARRAYSIZE(out)) &&
+          wcscmp(out, physical) == 0);
+    Check("profile path: case does not affect ownership", Core_ProfileFilePath(&p,
+          L"c:\\users\\x\\appdata\\roaming\\claude\\scratch-workspaces\\a\\b\\work", out, ARRAYSIZE(out)) &&
+          wcscmp(out, physical) == 0);
+    Check("profile path: physical descendant stays physical", Core_ProfileFilePath(&p, physical, out, ARRAYSIZE(out)) &&
+          wcscmp(out, physical) == 0);
+    Check("profile path: an external project stays external", Core_ProfileFilePath(&p, L"D:\\Project", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"D:\\Project") == 0);
+    Check("profile path: similarly named sibling stays separate", Core_ProfileFilePath(&p,
+          L"C:\\Users\\X\\AppData\\Roaming\\Claude-Work\\project", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"C:\\Users\\X\\AppData\\Roaming\\Claude-Work\\project") == 0);
+    StringCchCatW(p.dataDir, ARRAYSIZE(p.dataDir), L"\\");
+    StringCchCatW(p.storageDir, ARRAYSIZE(p.storageDir), L"\\");
+    Check("profile path: trailing root separators are bounded", Core_ProfileFilePath(&p,
+          L"C:\\Users\\X\\AppData\\Roaming\\Claude\\scratch-workspaces\\a\\b\\work", out, ARRAYSIZE(out)) &&
+          wcscmp(out, physical) == 0);
+    StringCchCopyW(out, ARRAYSIZE(out), logical);
+    Check("profile path: in-place logical root resolves", Core_ProfileFilePath(&p, out, out, ARRAYSIZE(out)) &&
+          wcscmp(out, storage) == 0);
+    StringCchCopyW(out, ARRAYSIZE(out), physical);
+    Check("profile path: in-place physical path is preserved", Core_ProfileFilePath(&p, out, out, ARRAYSIZE(out)) &&
+          wcscmp(out, physical) == 0);
+    Check("profile path: a small output fails empty", !Core_ProfileFilePath(&p, logical, out, 8) && !out[0]);
+    Check("profile path: a small external output fails empty", !Core_ProfileFilePath(&p, L"D:\\Project", out, 8) && !out[0]);
+    wmemset(large, L'x', ARRAYSIZE(large) - 1);
+    large[ARRAYSIZE(large) - 1] = 0;
+    StringCchCopyW(p.storageDir, ARRAYSIZE(p.storageDir), large);
+    Check("profile path: a long mapped path fails empty", !Core_ProfileFilePath(&p,
+          L"C:\\Users\\X\\AppData\\Roaming\\Claude\\project", out, ARRAYSIZE(out)) && !out[0]);
+    p.storageDir[0] = 0;
+    Check("profile path: unresolved storage refuses logical I/O", !Core_ProfileFilePath(&p, logical, out, ARRAYSIZE(out)) && !out[0]);
+    Check("profile path: unresolved storage permits external I/O", Core_ProfileFilePath(&p, L"D:\\Project", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"D:\\Project") == 0);
+    Check("profile path: a missing input fails empty", !Core_ProfileFilePath(&p, NULL, out, ARRAYSIZE(out)) && !out[0]);
+    Check("profile path: an empty input fails empty", !Core_ProfileFilePath(&p, L"", out, ARRAYSIZE(out)) && !out[0]);
+    Check("profile path: a missing profile fails empty", !Core_ProfileFilePath(NULL, logical, out, ARRAYSIZE(out)) && !out[0]);
+    Check("profile path: a missing output is refused", !Core_ProfileFilePath(&p, logical, NULL, ARRAYSIZE(out)));
+    Check("profile path: an empty output buffer is refused", !Core_ProfileFilePath(&p, logical, out, 0));
+    StringCchCopyW(p.storageDir, ARRAYSIZE(p.storageDir), p.dataDir);
+    Check("profile path: a physical profile preserves its path", Core_ProfileFilePath(&p,
+          L"C:\\Users\\X\\AppData\\Roaming\\Claude\\project", out, ARRAYSIZE(out)) &&
+          wcscmp(out, L"C:\\Users\\X\\AppData\\Roaming\\Claude\\project") == 0);
+}
+
 static BOOL Member(const char *json, const char *key, const char *expect)
 {
     const char *v = NULL;
@@ -589,6 +647,7 @@ int wmain(void)
     TestShortcuts();
     TestMisc();
     TestPathsAndTimes();
+    TestProfileFilePaths();
     TestJsonAndVersions();
     printf("%d checks, %d failed\n", g_checks, g_failures);
     return g_failures ? 1 : 0;

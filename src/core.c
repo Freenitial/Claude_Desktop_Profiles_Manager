@@ -482,6 +482,41 @@ BOOL Core_PathUnder(const WCHAR *path, const WCHAR *dir)
     return path[dl] == 0 || path[dl] == L'\\';
 }
 
+/* Stored working directories use the profile's logical path. File access
+ * outside its package uses the same suffix below the resolved storage. */
+BOOL Core_ProfileFilePath(const Profile *p, const WCHAR *path, WCHAR *out, size_t cch)
+{
+    WCHAR resolved[MAX_PATH];
+    const WCHAR *result = path;
+    size_t logical, physical;
+    if (!out || !cch) return FALSE;
+    if (!p || !path || !*path) {
+        out[0] = 0;
+        return FALSE;
+    }
+    if (Core_PathUnder(path, p->dataDir)) {
+        if (!p->storageDir[0]) {
+            out[0] = 0;
+            return FALSE;
+        }
+        logical = LengthWithoutTrailingSlash(p->dataDir);
+        physical = LengthWithoutTrailingSlash(p->storageDir);
+        if (FAILED(StringCchPrintfW(resolved, ARRAYSIZE(resolved), L"%.*s%s",
+                                    (int)physical, p->storageDir, path + logical))) {
+            out[0] = 0;
+            return FALSE;
+        }
+        result = resolved;
+    }
+    if (result == out) {
+        if (wcslen(result) < cch) return TRUE;
+    } else if (SUCCEEDED(StringCchCopyW(out, cch, result))) {
+        return TRUE;
+    }
+    out[0] = 0;
+    return FALSE;
+}
+
 /* The two times are the same to the shell (FAT date and time, 2-second steps). */
 BOOL Core_SameFatTime(const FILETIME *a, const FILETIME *b)
 {

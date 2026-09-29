@@ -8,7 +8,7 @@ Measured on Claude Desktop 2.9939 (MSIX) and Windows 11 26200. All of it relies 
 
 Claude Desktop is an Electron (Chromium) app, and Chromium allows one instance per user data folder. Started with another `--user-data-dir`, it runs a second, independent instance with its own sign-in.
 
-| Profile | Data folder | Started with |
+| Profile | Data folder seen by Claude | Started with |
 |---|---|---|
 | Main | `%APPDATA%\Claude` | no argument, like the Start menu |
 | Others | `%APPDATA%\Claude-<name>` | `--user-data-dir="%APPDATA%\Claude-<name>"` |
@@ -40,8 +40,11 @@ Claude Desktop Profiles Manager uses `ActivateApplication(<family>!Claude, argum
 
 With its identity, Claude writes to AppData through the package's private copy, `%LOCALAPPDATA%\Packages\<family>\LocalCache`:
 
+- Main's data is in `%APPDATA%\Claude` when that folder exists. When it does not, Main's files are in `LocalCache\Roaming\Claude`; Claude logs `Filesystem virtualization active` when it detects that location. This is normal for an installation whose Main profile was first opened through the MSIX package;
 - a `--user-data-dir` that does not exist yet is created there, under `LocalCache\Roaming`. Claude Desktop Profiles Manager therefore creates a profile's folder before its first start (never Main's);
 - a profile's logs (`%LOCALAPPDATA%\<folder>\logs`) can land in `LocalCache\Local\<folder>\logs`, so both places are read, and both are removed with the profile.
+
+The manager keeps two paths for a profile. `Profile.dataDir` is the logical path seen by Claude, `%APPDATA%\<folder>`: it identifies a running instance, supplies launch arguments and matches the working folders recorded in sessions. `Profile.storageDir` is the physical path used for file access: the same folder for ordinary profiles, or Main's `LocalCache\Roaming\Claude` when the real Main folder is absent. Configuration, session entries, scratch files and settings copies use the physical path. Resolving it never creates `%APPDATA%\Claude`.
 
 The package is `Claude_pzs8sxrjxfjjc` (from claude.ai) or `AnthropicPBC.Claude_fnn82j28hfe8t` (Microsoft Store), else any other package named Claude.
 
@@ -91,13 +94,17 @@ A Code-tab session is stored in two places:
 
 Claude shows the entries of the account signed in (`lastKnownAccountUuid` in the profile's `config.json`) and its current organization, taken as the one with the latest entry; the entries of an account signed in before stay on disk but are not shown. A session without a project folder works in `<profile data>\scratch-workspaces\<account>\<organization>\scratch-...`: Claude shows it under "no folder" only in the profile that owns that area. A session run over SSH (`sshConfig` in its entry), in WSL (`wslConfig`) or in the cloud (`cloudSessionId`, `movedToCloud`) has its conversation elsewhere: the manager does not list it, it only counts it.
 
-**Sessions >**, at the top left of the manager, turns the window to its sessions view; **< Back** turns it back. On the left the profiles, with how many sessions each lists; in the middle the chosen profile's favorites, folders and sessions as a tree, which the search box filters; on the right the selected session: its folder's path (a button that opens it in Explorer), when it was last used and the size of its conversation stay at the top; **Delete session everywhere** stays at the bottom; between them each profile (struck out where the session is not listed) with a star where it is a favorite, its title there when it differs (in italics), open or in use there, archived there, and an **Actions** menu, scrolling when there are more profiles than room. The same actions are in the tree's context menu; Enter or a double click opens the session, F2 renames it, Delete removes it. An empty tree says why (not signed in, no session yet, all archived, nothing matches the search, only remote sessions); below the session, notes say what is missing (remote sessions not listed, entries that could not be read, no transcripts folder). While it shows, the view follows the disk through folder notifications on each profile's entries and on the transcripts folder; a burst of changes reloads it once.
+For a virtualized Main profile, its configuration and entries are read from `Profile.storageDir`, while a session's `cwd` remains the logical path Claude recorded. Opening its scratch folder in Explorer or copying its files translates that path to the physical folder. Transcripts in `%USERPROFILE%\.claude` and the manager's pending-change files are outside this translation.
+
+The manager's log records each profile's resolved data and entries paths, or why no entries folder was found. It records the source again when that resolution changes.
+
+**Sessions >**, at the top left of the manager, turns the window to its sessions view; **< Back** turns it back. On the left the profiles, with how many sessions each lists; in the middle the chosen profile's favorites, folders and sessions as a tree, which the search box filters; on the right the selected session: its folder's path (a button that opens it in Explorer), when it was last used and the size of its conversation stay at the top; **Delete session everywhere** stays at the bottom; between them each profile (struck out where the session is not listed) with a star where it is a favorite, its title there when it differs (in italics), open or in use there, archived there, and an **Actions** menu, scrolling when there are more profiles than room. The same actions are in the tree's context menu; Enter or a double click opens the session, F2 renames it, Delete removes it. An empty tree says why (not signed in, no session yet, all archived, nothing matches the search, only remote sessions); below the session, notes say what is missing (remote sessions not listed, entries that could not be read, no transcripts folder). While it shows, the view follows the disk through folder notifications on each profile's physical entries folder and on the transcripts folder; a burst of changes reloads it once. A missing folder is watched through an existing ancestor, and the subscriptions follow changes to the resolved paths.
 
 ### Session actions
 
 - **Open** starts the profile, or reaches its window, with `claude://resume?session=<id>`. Claude opens the session, and first adds its entry when the profile does not list it yet (`local_<id>`).
 - **Share** sends that link to a profile that does not list the session: both profiles then go on with the same conversation. A session without a folder shows there in a folder named `scratch-...`, not under "no folder", which is the other profile's area.
-- **Copy** writes a new conversation with a new id: the transcript with every `sessionId` replaced, and for a session without a folder, its `cwd` pointed at a copy of its scratch folder made in the target's own area. The target then opens it with the link; the copy goes on separately.
+- **Copy** writes a new conversation with a new id: the transcript with every `sessionId` replaced, and for a session without a folder, its `cwd` pointed at a copy of its scratch folder made in the target's own area. Scratch files are copied between the physical folders; the transcript's `cwd` and the derived project-folder name use the target's logical path, including when Main is virtualized. The target then opens it with the link; the copy goes on separately.
 - **Rename**, **Favorite** and **Remove** change that profile's entry: `title` (with `titleSource` `user`), `isStarred`, or the entry itself, which goes to the Recycle Bin. A shared or copied session gets the title it has in the profile it came from.
 - **Delete session everywhere** moves every entry of the session, its transcript (`<id>.jsonl`) and its `<id>` folder, in every project folder, to the Recycle Bin. It waits until the profiles that list the session are closed.
 
@@ -107,7 +114,7 @@ A running Claude keeps its sessions in memory and writes them back: an entry cha
 
 Claude Code records each session it runs in `%USERPROFILE%\.claude\sessions\<pid>.json` (`pid`, `sessionId`, `procStart`). A session whose process still runs, with the same start time, under a profile's Claude process is "in use" there. A session in use in two profiles at once gets a warning: each profile goes on from what it read, so go on in one of them only.
 
-`build.cmd` also runs `tests/test_claude.c`, which looks up in the installed Claude Desktop (its `app.asar` and `Claude.exe`) and in the Claude Code it installed each fact this document relies on: the `claude://resume` link, the quit and sign-in log lines, the session entry fields (and the ones that mark a remote session), the "no folder" area (`userData` + `scratch-workspaces`) and how its folders are named, the window classes, the transcript lookup by id, how a project folder is named after its path, the running-session records. A Claude update that changes one of them makes the build fail with that fact's name.
+`build.cmd` also runs `tests/test_claude.c`, which looks up in the installed Claude Desktop (its `app.asar` and `Claude.exe`) and in the Claude Code it installed each fact this document relies on: the `claude://resume` link, the quit, sign-in and filesystem-virtualization log lines, the session entry fields (and the ones that mark a remote session), the "no folder" area (`userData` + `scratch-workspaces`) and how its folders are named, the window classes, the transcript lookup by id, how a project folder is named after its path, the running-session records. It searches for Claude Code under both the real Roaming AppData folder and the package's `LocalCache\Roaming`. A Claude update that changes one of them makes the build fail with that fact's name. These checks confirm the installed files contain the expected behavior markers; they do not reproduce a clean Windows installation.
 
 ## Opening at sign-in
 

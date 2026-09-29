@@ -75,7 +75,9 @@ typedef struct SessionsView {
     int           hotChip, pressedChip, openChip;
     int           scroll;               /* how far the profiles' parts are scrolled, px */
     HANDLE        watchThread, watchStop;
-    WCHAR         watched[MAX_PROFILES][FOLDER_CCH];
+    WCHAR         watched[WATCH_MAX][MAX_PATH];
+    BOOL          watchedSubtree[WATCH_MAX];
+    DWORD         watchedFilter[WATCH_MAX];
     int           watchedCount;
     WCHAR         collapsed[MAX_COLLAPSED][MAX_PATH];   /* folders the user folded */
     int           collapsedCount;
@@ -937,6 +939,11 @@ static void ScrollDetails(WPARAM wp)
     InvalidateRect(v.parts, NULL, FALSE);
 }
 
+static BOOL FolderOnDisk(const SessionRow *row, WCHAR *out, size_t cch)
+{
+    return row->cwd[0] && SessionStore_WorkingDir(&v.set, row->cwd, out, cch) && Util_DirExists(out);
+}
+
 /* The selected session's details that stay: from the tree's top (the
  * search box's row above stays empty), its folder's path (a button that
  * shows the folder), when it was last used, how big its conversation is, a
@@ -945,7 +952,7 @@ static void ScrollDetails(WPARAM wp)
  * (DrawParts) is placed. With no session selected: why, and the notes. */
 static void DrawDetails(const DRAWITEMSTRUCT *di)
 {
-    WCHAR text[MAX_PATH * 2], date[64], time[32], names[160], notes[3][320];
+    WCHAR text[MAX_PATH * 2], date[64], time[32], names[160], notes[3][320], folder[MAX_PATH];
     ThemeBuffer buffer;
     RECT rc = di->rcItem, line, remove, tree = ChildRect(v.treeArea), self = ChildRect(v.details), was;
     int r = SelectedRow(), n, i, left = rc.left, right = rc.right, y = rc.top, top, bottom;
@@ -967,7 +974,7 @@ static void DrawDetails(const DRAWITEMSTRUCT *di)
     y = rc.top + tree.top - self.top;
     if (row->cwd[0]) {
         SetRect(&line, left, y, right, y + ControlHeight());
-        if (Util_DirExists(row->cwd)) {
+        if (FolderOnDisk(row, folder, ARRAYSIZE(folder))) {
             line.right = min(right, left + TextWidth(dc, THEME_FONT_TEXT, row->cwd) + 3 * v.pad);
             AddChip(v.details, dc, ACT_SHOW_FOLDER, -1, row->cwd, &line);
         } else {
@@ -1317,6 +1324,7 @@ static void DeleteEverywhere(int r)
 
 static void RunAction(Action action, int p)
 {
+    WCHAR folder[MAX_PATH];
     int r = SelectedRow();
     if (r < 0) return;
     if (p < 0) p = ProfileIndex();
@@ -1329,7 +1337,10 @@ static void RunAction(Action action, int p)
     case ACT_KEEP:        Keep(r, p); break;
     case ACT_SHARE:       Share(r, p); break;
     case ACT_COPY:        Copy(r, p); break;
-    case ACT_SHOW_FOLDER: ShellExecuteW(v.dlg, L"explore", v.set.rows[r].cwd, NULL, NULL, SW_SHOWNORMAL); break;
+    case ACT_SHOW_FOLDER:
+        if (FolderOnDisk(&v.set.rows[r], folder, ARRAYSIZE(folder)))
+            ShellExecuteW(v.dlg, L"explore", folder, NULL, NULL, SW_SHOWNORMAL);
+        break;
     case ACT_DELETE_ALL:  DeleteEverywhere(r); break;
     default: break;
     }
@@ -1484,7 +1495,11 @@ static void ShowMenu(POINT pt)
         AppendEntryActions(menu, row, p, name, TRUE);
     }
     AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING | (row->cwd[0] && Util_DirExists(row->cwd) ? 0 : MF_GRAYED), MenuId(ACT_SHOW_FOLDER, p), L"Show &folder");
+    {
+        WCHAR folder[MAX_PATH];
+        AppendMenuW(menu, MF_STRING | (FolderOnDisk(row, folder, ARRAYSIZE(folder)) ? 0 : MF_GRAYED),
+                    MenuId(ACT_SHOW_FOLDER, p), L"Show &folder");
+    }
     AppendMenuW(menu, MF_STRING, MenuId(ACT_DELETE_ALL, p), L"&Delete session everywhere\x2026");
     cmd = (UINT)TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, v.dlg, NULL);
     DestroyMenu(menu);   /* its submenus with it */
@@ -1536,12 +1551,13 @@ static void StopWatching(void)
     v.watchedCount = 0;
 }
 
-static BOOL WatchingThese(void)
+static BOOL WatchingThese(const WatchPlan *plan)
 {
     int i;
-    if (!v.watchThread || v.watchedCount != v.set.profiles.count) return FALSE;
+    if (!v.watchThread || v.watchedCount != plan->count) return FALSE;
     for (i = 0; i < v.watchedCount; i++)
-        if (CompareStringOrdinal(v.watched[i], -1, ProfileAt(i)->folder, -1, TRUE) != CSTR_EQUAL) return FALSE;
+        if (!Core_PathEquals(v.watched[i], plan->dirs[i]) || v.watchedSubtree[i] != plan->subtree[i] ||
+            v.watchedFilter[i] != plan->filter[i]) return FALSE;
     return TRUE;
 }
 
@@ -1551,35 +1567,47 @@ static void Watch(void)
 {
     WatchPlan *plan;
     int i;
-    if (WatchingThese()) return;
-    StopWatching();
     plan = (WatchPlan *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof *plan);
+    if (!plan) return;
+    for (i = 0; i < v.set.profiles.count; i++) {
+        const Profile *p = ProfileAt(i);
+        WCHAR entries[MAX_PATH];
+        WCHAR *dir = plan->dirs[plan->count];
+        if (!SessionStore_WatchDir(p, dir, MAX_PATH)) continue;
+        plan->subtree[plan->count] = TRUE;
+        plan->filter[plan->count] = FILE_NOTIFY_CHANGE_DIR_NAME;
+        if (SessionStore_SessionsDir(p, entries, ARRAYSIZE(entries)) && Core_PathEquals(dir, entries))
+            plan->filter[plan->count] |= FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE;
+        plan->count++;
+    }
+    {
+        WCHAR projects[MAX_PATH];
+        WCHAR *dir = plan->dirs[plan->count];
+        if (SessionStore_ProjectsDir(projects, ARRAYSIZE(projects)) && Util_ExistingDir(projects, dir, MAX_PATH)) {
+            plan->subtree[plan->count] = TRUE;
+            plan->filter[plan->count] = FILE_NOTIFY_CHANGE_DIR_NAME;
+            if (Core_PathEquals(dir, projects)) plan->filter[plan->count] |= FILE_NOTIFY_CHANGE_FILE_NAME;
+            plan->count++;
+        }
+    }
+    if (WatchingThese(plan)) {
+        HeapFree(GetProcessHeap(), 0, plan);
+        return;
+    }
+    StopWatching();
     v.watchStop = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!plan || !v.watchStop) {
-        if (plan) HeapFree(GetProcessHeap(), 0, plan);
+    if (!v.watchStop) {
+        HeapFree(GetProcessHeap(), 0, plan);
         return;
     }
     plan->dlg = v.dlg;
     plan->stop = v.watchStop;
-    for (i = 0; i < v.set.profiles.count; i++) {
-        const Profile *p = ProfileAt(i);
-        WCHAR *dir = plan->dirs[plan->count];
-        if (SessionStore_SessionsDir(p, dir, MAX_PATH) && Util_DirExists(dir)) {
-            plan->subtree[plan->count] = TRUE;
-            plan->filter[plan->count] = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE;
-        } else {
-            StringCchCopyW(dir, MAX_PATH, p->dataDir);
-            plan->filter[plan->count] = FILE_NOTIFY_CHANGE_DIR_NAME;
-        }
-        plan->count++;
-        StringCchCopyW(v.watched[i], FOLDER_CCH, p->folder);
+    for (i = 0; i < plan->count; i++) {
+        StringCchCopyW(v.watched[i], MAX_PATH, plan->dirs[i]);
+        v.watchedSubtree[i] = plan->subtree[i];
+        v.watchedFilter[i] = plan->filter[i];
     }
-    v.watchedCount = v.set.profiles.count;
-    if (SessionStore_ProjectsDir(plan->dirs[plan->count], MAX_PATH)) {
-        plan->subtree[plan->count] = TRUE;
-        plan->filter[plan->count] = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME;
-        plan->count++;
-    }
+    v.watchedCount = plan->count;
     v.watchThread = CreateThread(NULL, 0, WatchProc, plan, 0, NULL);
     if (!v.watchThread) {
         HeapFree(GetProcessHeap(), 0, plan);

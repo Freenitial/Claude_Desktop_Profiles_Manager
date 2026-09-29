@@ -82,6 +82,7 @@ src/app.ico                   application icon (made by tools/make-icon.ps1)
 src/version.h                 version shown in the app and in Settings
 tests/test_core.c             unit tests for core.c
 tests/test_pin.c              unit tests for the Favorites entry helpers of taskbar-pin.c
+tests/test_sessions.c         temporary fixtures for profile storage, sessions, scratch copies and settings
 tests/test_theme.c            checks what theme.c draws against Windows' own drawing
 tests/test_claude.c           checks the installed Claude Desktop still works as HOW-IT-WORKS.md says
 tools/make-icon.ps1           regenerates src/app.ico
@@ -93,4 +94,5 @@ tools/make-icon.ps1           regenerates src/app.ico
 - **Static CRT** - `/MT` and system DLLs only (listed in `build.cmd`): the exe runs on a bare Windows 10 1809+
 - **Tests** - Pure logic goes in `src/core.c`, with a test in `tests/test_core.c`; the pin entry helpers are tested in `tests/test_pin.c`; `tests/test_theme.c` compares what `src/theme.c` draws (rows and their three blues, list headers, edits, drop-down buttons and lists, scroll bars at the edges and following the wheel, lists scrolled by the pixel in their views, off-screen drawing) with what Windows draws, in the mode Windows is set to; `tests/test_claude.c` looks up in the installed Claude Desktop each fact the program relies on (skipped where Claude is not installed, as on GitHub Actions), so a Claude update that changes one fails the build
 - **Manual checks** - Use a throwaway profile (`%APPDATA%\Claude-<test>`) and delete it afterwards; never test with the Claude windows in daily use
+- **Session fixtures** - `tests/test_sessions.c` runs through `build.cmd` without launching Claude. It covers real and virtualized Main storage, the current account's entries, empty signed-in profiles, directory-watch targets, scratch copies in both directions and settings-copy exclusions. Its profiles and transcripts stay in a unique temporary directory, which it removes afterwards.
 - **Launching and routing** - Read [docs/HOW-IT-WORKS.md](docs/HOW-IT-WORKS.md) before changing them: it lists the measured behavior they rely on

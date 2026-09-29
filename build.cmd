@@ -48,6 +48,11 @@ cl %CFLAGS% /Fo"%OUT%\test\\" /Fe"%OUT%\test\test_pin.exe" "%ROOT%tests\test_pin
    /link /SUBSYSTEM:CONSOLE %LIBS% || exit /b 1
 "%OUT%\test\test_pin.exe" || exit /b 1
 
+rem Session storage and copies in private temporary fixtures.
+cl %CFLAGS% /Fo"%OUT%\test\\" /Fe"%OUT%\test\test_sessions.exe" "%ROOT%tests\test_sessions.c" "%OUT%\obj\*.obj" ^
+   /link /SUBSYSTEM:CONSOLE %LIBS% || exit /b 1
+"%OUT%\test\test_sessions.exe" || exit /b 1
+
 rem What theme.c draws, against Windows' own drawing (its manifest, for common controls 6, is embedded like the program's).
 cl %CFLAGS% /Fo"%OUT%\test\\" /Fe"%OUT%\test\test_theme.exe" "%ROOT%tests\test_theme.c" "%OUT%\obj\*.obj" ^
    /link /SUBSYSTEM:CONSOLE /MANIFEST:EMBED %LIBS% || exit /b 1

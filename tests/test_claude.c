@@ -127,31 +127,28 @@ static void CheckScratchRoot(const WCHAR *asar)
     }
 }
 
-/* The Claude Code that Claude Desktop installed last, for any profile. */
-static BOOL FindClaudeCode(WCHAR *out, size_t cch)
+/* Claude Code binaries under the profile folders of one Roaming root. */
+static BOOL FindClaudeCodeIn(const WCHAR *root, FILETIME *best, WCHAR *out, size_t cch)
 {
-    WCHAR appData[MAX_PATH], pattern[MAX_PATH], dir[MAX_PATH];
+    WCHAR pattern[MAX_PATH], dir[MAX_PATH];
     WIN32_FIND_DATAW pf, vf;
     HANDLE hp, hv;
-    FILETIME best = { 0, 0 };
     BOOL found = FALSE;
-    if (!Util_AppData(appData, ARRAYSIZE(appData)) ||
-        FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\Claude*", appData)))
-        return FALSE;
+    if (FAILED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\Claude*", root))) return FALSE;
     hp = FindFirstFileExW(pattern, FindExInfoBasic, &pf, FindExSearchLimitToDirectories, NULL, 0);
     if (hp == INVALID_HANDLE_VALUE) return FALSE;
     do {
         if (!(pf.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-        if (FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s\\claude-code\\*", appData, pf.cFileName))) continue;
+        if (FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s\\claude-code\\*", root, pf.cFileName))) continue;
         hv = FindFirstFileExW(dir, FindExInfoBasic, &vf, FindExSearchLimitToDirectories, NULL, 0);
         if (hv == INVALID_HANDLE_VALUE) continue;
         do {
             WCHAR exe[MAX_PATH];
             if (!(vf.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || vf.cFileName[0] == L'.') continue;
-            if (FAILED(StringCchPrintfW(exe, ARRAYSIZE(exe), L"%s\\%s\\claude-code\\%s\\claude.exe", appData, pf.cFileName, vf.cFileName)) ||
-                !Util_FileExists(exe) || CompareFileTime(&vf.ftLastWriteTime, &best) <= 0)
+            if (FAILED(StringCchPrintfW(exe, ARRAYSIZE(exe), L"%s\\%s\\claude-code\\%s\\claude.exe", root, pf.cFileName, vf.cFileName)) ||
+                !Util_FileExists(exe) || CompareFileTime(&vf.ftLastWriteTime, best) <= 0)
                 continue;
-            best = vf.ftLastWriteTime;
+            *best = vf.ftLastWriteTime;
             StringCchCopyW(out, cch, exe);
             found = TRUE;
         } while (FindNextFileW(hv, &vf));
@@ -161,12 +158,29 @@ static BOOL FindClaudeCode(WCHAR *out, size_t cch)
     return found;
 }
 
+/* The Claude Code that Claude Desktop installed last, including a profile
+ * stored in its package's LocalCache. Discovery only reads these folders. */
+static BOOL FindClaudeCode(const ClaudePackage *pkg, WCHAR *out, size_t cch)
+{
+    WCHAR roaming[MAX_PATH], local[MAX_PATH];
+    FILETIME best = { 0, 0 };
+    BOOL found = FALSE;
+    if (Util_AppData(roaming, ARRAYSIZE(roaming)))
+        found = FindClaudeCodeIn(roaming, &best, out, cch);
+    if (pkg->found && Util_LocalAppData(local, ARRAYSIZE(local)) &&
+        SUCCEEDED(StringCchPrintfW(roaming, ARRAYSIZE(roaming), L"%s\\Packages\\%s\\LocalCache\\Roaming", local, pkg->family)) &&
+        FindClaudeCodeIn(roaming, &best, out, cch))
+        found = TRUE;
+    return found;
+}
+
 int wmain(void)
 {
     Fact app[] = {
         { "claude://resume?session=<id> imports a transcript into the running profile", "Resume deep link: importing CLI session", FALSE, FALSE },
         { "the link host is \"resume\"", ".Resume=\"resume\"", FALSE, FALSE },
         { "the import creates the profile's entry itself", "Imported CLI session ", FALSE, FALSE },
+        { "Claude logs when its data folder is virtualized by MSIX", "Filesystem virtualization active", FALSE, FALSE },
         { "Claude's updater logs its quit for an update", "beforeQuitForUpdate handler fired", FALSE, FALSE },
         { "a close by Windows logs \"Windows session ending (...)\"", "Windows session ending (", FALSE, FALSE },
         { "a quit from the window logs \"Quitting app\"", "Quitting app", FALSE, FALSE },
@@ -225,7 +239,7 @@ int wmain(void)
     else wprintf(L"  FAIL  cannot read %s\n", path), g_failures++, g_checks++;
     if (Scan(pkg.exe, exe, ARRAYSIZE(exe))) Report(pkg.exe, exe, ARRAYSIZE(exe));
     else wprintf(L"  FAIL  cannot read %s\n", pkg.exe), g_failures++, g_checks++;
-    if (FindClaudeCode(code, ARRAYSIZE(code))) {
+    if (FindClaudeCode(&pkg, code, ARRAYSIZE(code))) {
         wprintf(L"Claude Code %s\n", code);
         if (Scan(code, cli, ARRAYSIZE(cli))) Report(code, cli, ARRAYSIZE(cli));
         else wprintf(L"  FAIL  cannot read %s\n", code), g_failures++, g_checks++;
