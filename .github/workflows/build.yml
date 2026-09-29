@@ -1,0 +1,38 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    # The drawing tests open windows: one left waiting must not hold the runner for hours.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check the tag against src/version.h
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $version = [regex]::Match((Get-Content src/version.h -Raw), 'APP_VERSION_STR\s+"([^"]+)"').Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match APP_VERSION_STR ""$version"" in src/version.h" }
+
+      - name: Build and run the unit tests
+        shell: cmd
+        run: build.cmd
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ClaudeDesktopProfilesManager
+          path: build/ClaudeDesktopProfilesManager.exe
+          if-no-files-found: error
+

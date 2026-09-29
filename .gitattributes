@@ -1,0 +1,22 @@
+# Normalize text files; pin Windows-native endings where it matters.
+* text=auto
+
+# cmd is the only interpreter that can be picky about line endings: pin CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Sources and docs
+*.c        text
+*.h        text
+*.manifest text
+*.md       text
+*.yml      text
+
+# app.rc is ASCII. If it is ever saved as UTF-16, change this line to: *.rc -text
+*.rc       text
+
+# Binary assets
+*.ico binary
+*.png binary
+*.gif binary

@@ -1,0 +1,74 @@
+Claude Desktop Profiles Manager License
+
+Copyright (c) 2026 Léo Gillet - Freenitial
+
+## Open Source Components
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+This applies to ALL components of the Software EXCEPT the Taskbar Module as
+defined below.
+
+## Taskbar Module - Commercial License Required
+
+The following components are excluded from the open source license above and
+are subject to a separate commercial license:
+
+- The files `src/taskbar-pin.c` and `src/taskbar.c` and all their functions
+- Code directly responsible for writing to the Windows Taskband registry,
+  constructing, repairing or updating PIDL blob entries, injecting BEEF001D
+  extension blocks, or acquiring the `TaskbarPinListMutex` system mutex
+- Code directly responsible for setting window AppUserModel properties to
+  control taskbar buttons, refreshing taskbar icons through shell change
+  notifications, or detecting snap groups
+- Anything for the purpose of programmatic taskbar pinning or of controlling
+  the taskbar's buttons, pins and icons
+
+Collectively referred to as the "Taskbar Module."
+
+The notification-area code (`src/tray.c`) is not part of the Taskbar Module:
+it is under the open source license above.
+
+### Permitted Use (Free)
+
+The Taskbar Module may be used free for:
+
+- Personal, non-commercial use
+- Educational and academic purposes
+- Open source projects
+- Evaluation and testing
+
+### Commercial License Required
+
+A paid commercial license is required to use the Taskbar Module in
+any of the following contexts:
+
+- Commercial software products (sold, licensed, or distributed for revenue)
+- SaaS platforms, managed services, or hosted applications
+- Any product or service generating direct or indirect revenue
+
+For commercial licensing inquiries, contact: freenitial@gmail.com
+
+### Redistribution
+
+Redistributions of the Software that include the Taskbar Module must
+retain this license file in its entirety and may not remove or alter the
+commercial license terms.
+
+## Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

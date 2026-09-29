@@ -1,0 +1,51 @@
+# Build output (build.cmd writes build\)
+/build/
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.iobj
+*.ipdb
+
+# Programs and archives (the release publishes the exe; no program or archive is committed)
+*.exe
+*.zip
+*.7z
+
+# Code signing - keys and certificates never leave this machine
+_signing/
+*.pfx
+*.p12
+*.pem
+*.key
+*.pvk
+*.cer
+*.crt
+
+# Editors
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+
+# Local tooling / workspace - never publish
+# (AGENTS.md is committed: it holds the project rules for contributors and coding agents)
+.claude/
+CLAUDE.local.md
+_dev/
+RELEASE_NOTES.md
+
+# Test leftovers, logs, temporary files
+*.lnk
+*.log
+*.tmp
+*.bak
+
+# OS
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+.DS_Store

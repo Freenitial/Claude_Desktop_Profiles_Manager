@@ -1,0 +1,125 @@
+#include <windows.h>
+#include <commctrl.h>
+#include "resource.h"
+#include "version.h"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+IDI_APP ICON "app.ico"
+1 RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+ PRODUCTVERSION APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH, 0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "Freenitial"
+            VALUE "FileDescription", "Claude Desktop Profiles Manager"
+            VALUE "FileVersion", APP_VERSION_STR
+            VALUE "InternalName", "ClaudeDesktopProfilesManager"
+            VALUE "LegalCopyright", "Copyright (c) 2026 Freenitial"
+            VALUE "OriginalFilename", "ClaudeDesktopProfilesManager.exe"
+            VALUE "ProductName", "Claude Desktop Profiles Manager"
+            VALUE "ProductVersion", APP_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
+IDD_MAIN DIALOGEX 0, 0, 420, 270
+STYLE DS_SHELLFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX
+CLASS "ClaudeDesktopProfilesManagerMain"
+CAPTION "Claude Desktop Profiles Manager"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    PUSHBUTTON      "&Sessions  >", IDC_SESSIONS, 10, 6, 76, 15
+    RTEXT           "", IDC_STATUS, 92, 10, 318, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    PUSHBUTTON      "", IDC_FIX, 334, 6, 76, 15, NOT WS_VISIBLE
+    CONTROL         "", IDC_LIST, "SysListView32", LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP, 10, 26, 316, 168
+    DEFPUSHBUTTON   "&Open", IDC_OPEN, 334, 26, 76, 15
+    PUSHBUTTON      "&New profile...", IDC_NEW, 334, 47, 76, 15
+    PUSHBUTTON      "&Edit...", IDC_EDIT, 334, 66, 76, 15
+    PUSHBUTTON      "&Delete...", IDC_DELETE, 334, 85, 76, 15
+    PUSHBUTTON      "Set as de&fault", IDC_DEFAULT, 334, 110, 76, 15
+    LTEXT           "", IDC_NOTE, 334, 132, 78, 60, SS_NOPREFIX
+    CONTROL         "Shortcuts", IDC_SC_GROUP, "Static", SS_OWNERDRAW | SS_NOPREFIX, 10, 202, 400, 10
+    PUSHBUTTON      "Create shortcut on desktop", IDC_SC_DESKTOP, 10, 215, 104, 15
+    PUSHBUTTON      "Create shortcut...", IDC_SC_SAVEAS, 120, 215, 84, 15
+    PUSHBUTTON      "Pin to taskbar", IDC_SC_PIN, 210, 215, 84, 15
+    PUSHBUTTON      "Add to Start menu", IDC_SC_START, 300, 215, 110, 15
+    LISTBOX         IDC_S_PROFILES, 10, 26, 96, 212, LBS_OWNERDRAWFIXED | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT | WS_VSCROLL | WS_TABSTOP | NOT WS_BORDER | NOT WS_VISIBLE
+    EDITTEXT        IDC_S_SEARCH, 112, 26, 120, 14, ES_AUTOHSCROLL | NOT WS_VISIBLE
+    AUTOCHECKBOX    "Show &archived", IDC_S_ARCHIVED, 236, 28, 64, 10, NOT WS_VISIBLE
+    CONTROL         "", IDC_S_TREE, "SysTreeView32", TVS_HASBUTTONS | TVS_LINESATROOT | TVS_SHOWSELALWAYS | TVS_FULLROWSELECT | TVS_NOHSCROLL | TVS_INFOTIP | TVS_NONEVENHEIGHT | TVS_TRACKSELECT | WS_BORDER | WS_TABSTOP | NOT WS_VISIBLE, 112, 44, 180, 194
+    CONTROL         "", IDC_S_DETAILS, "Static", SS_OWNERDRAW | SS_NOTIFY | WS_CLIPCHILDREN | NOT WS_VISIBLE, 298, 26, 112, 212
+    PUSHBUTTON      "&Uninstall...", IDC_UNINSTALL, 10, 246, 76, 15
+    CONTROL         "", IDC_ABOUT, "SysLink", WS_TABSTOP | LWS_TRANSPARENT | LWS_USECUSTOMTEXT, 94, 249, 232, 10
+    PUSHBUTTON      "Up&date", IDC_UPDATE, 272, 246, 56, 15, NOT WS_VISIBLE
+    PUSHBUTTON      "Close", IDCANCEL, 334, 246, 76, 15
+END
+
+IDD_PROFILE DIALOGEX 0, 0, 268, 142
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Profile"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "&Name:", -1, 10, 13, 40, 10
+    EDITTEXT        IDC_P_NAME, 52, 10, 164, 14, ES_AUTOHSCROLL
+    LTEXT           "&Color:", -1, 10, 34, 40, 10
+    COMBOBOX        IDC_P_COLOR, 52, 31, 92, 120, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    CONTROL         "", IDC_P_PREVIEW, "Static", SS_ICON | SS_CENTERIMAGE | SS_REALSIZEIMAGE, 226, 8, 32, 32
+    LTEXT           "", IDC_P_FOLDER, 10, 52, 248, 18, SS_NOPREFIX
+    LTEXT           "", IDC_P_ERROR, 10, 52, 248, 18, SS_NOPREFIX | NOT WS_VISIBLE
+    AUTOCHECKBOX    "Open at &Windows sign-in", IDC_P_STARTUP, 10, 76, 200, 10
+    AUTOCHECKBOX    "", IDC_P_COPY, 10, 89, 248, 10
+    AUTOCHECKBOX    "&Open it now to sign in", IDC_P_OPEN, 10, 102, 140, 10
+    DEFPUSHBUTTON   "OK", IDOK, 154, 120, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 120, 50, 15
+END
+
+IDD_TITLE DIALOGEX 0, 0, 268, 68
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Rename session"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "", IDC_T_LABEL, 10, 10, 248, 10, SS_NOPREFIX | SS_ENDELLIPSIS
+    EDITTEXT        IDC_T_TITLE, 10, 23, 248, 14, ES_AUTOHSCROLL
+    DEFPUSHBUTTON   "Rename", IDOK, 154, 46, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 208, 46, 50, 15
+END
+
+IDD_MESSAGE DIALOGEX 0, 0, 282, 70
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Claude Desktop Profiles Manager"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    CONTROL         "", IDC_M_ICON, "Static", SS_ICON | SS_REALSIZEIMAGE, 10, 10, 20, 20
+    LTEXT           "", IDC_M_TEXT, 40, 12, 232, 24, SS_NOPREFIX | SS_EDITCONTROL
+    DEFPUSHBUTTON   "OK", IDOK, 164, 48, 52, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 220, 48, 52, 15
+END
+
+IDD_UNINSTALL DIALOGEX 0, 0, 292, 206
+STYLE DS_SHELLFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "Uninstall Claude Desktop Profiles Manager"
+FONT 9, "Segoe UI", 400, 0, 0x1
+BEGIN
+    LTEXT           "This removes Claude Desktop Profiles Manager, its shortcuts, its taskbar pins and its claude:// link handler, and gives claude:// links back to Claude.", -1, 10, 10, 272, 30
+    LTEXT           "", IDC_U_KEEP, 10, 44, 272, 20, SS_NOPREFIX
+    LTEXT           "Keep the data of these profiles (unchecked ones go to the Recycle Bin):", IDC_U_LABEL, 10, 70, 272, 10
+    CONTROL         "", IDC_U_LIST, "SysListView32", LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP, 10, 82, 272, 68
+    LTEXT           "Kept profiles stay in %APPDATA%: a new install finds them again, with default names and colors.", IDC_U_HINT, 10, 154, 272, 18
+    DEFPUSHBUTTON   "Uninstall", IDOK, 178, 182, 50, 15
+    PUSHBUTTON      "Cancel", IDCANCEL, 232, 182, 50, 15
+END
