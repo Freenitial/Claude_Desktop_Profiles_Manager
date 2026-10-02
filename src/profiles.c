@@ -11,6 +11,10 @@
 #include "app.h"
 #include <stdlib.h>
 
+#define VALUE_NAME            L"Name"             /* under the profile's key */
+#define VALUE_COLOR           L"Color"
+#define VALUE_DEFAULT_PROFILE L"DefaultProfile"   /* under REG_ROOT */
+
 static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
 {
     StringCchPrintfW(out, cch, REG_PROFILES L"\\%s", folder);
@@ -22,67 +26,97 @@ static void ProfileKey(const WCHAR *folder, WCHAR *out, size_t cch)
 BOOL Profiles_ResolveStorage(Profile *p, const WCHAR *localAppData, const WCHAR *family)
 {
     WCHAR parent[MAX_PATH], *slash;
-    DWORD attr, error;
-    size_t n;
+    DWORD attributes;
     if (!p) return FALSE;
     p->storageDir[0] = 0;
     if (!p->dataDir[0]) return FALSE;
     if (!p->isStock)
         return SUCCEEDED(StringCchCopyW(p->storageDir, ARRAYSIZE(p->storageDir), p->dataDir));
-    attr = GetFileAttributesW(p->dataDir);
-    if (attr != INVALID_FILE_ATTRIBUTES) {
-        if (!(attr & FILE_ATTRIBUTE_DIRECTORY)) return FALSE;
-        return SUCCEEDED(StringCchCopyW(p->storageDir, ARRAYSIZE(p->storageDir), p->dataDir));
+    switch (Util_QueryPath(p->dataDir, &attributes)) {
+    case PATH_PRESENT:
+        return (attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+               SUCCEEDED(StringCchCopyW(p->storageDir, ARRAYSIZE(p->storageDir), p->dataDir));
+    case PATH_UNREACHABLE:
+        return FALSE;
+    case PATH_MISSING:
+        break;
     }
-    error = GetLastError();
-    if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) return FALSE;
+    if (!localAppData || !*localAppData || !family || !*family) return FALSE;
     if (FAILED(StringCchCopyW(parent, ARRAYSIZE(parent), p->dataDir))) return FALSE;
-    n = wcslen(parent);
-    while (n > 3 && (parent[n - 1] == L'\\' || parent[n - 1] == L'/')) parent[--n] = 0;
+    parent[Core_TrimmedPathLength(parent)] = 0;
     slash = wcsrchr(parent, L'\\');
     if (!slash || slash == parent) return FALSE;
     *slash = 0;
-    if (!Util_DirExists(parent) || !localAppData || !*localAppData || !family || !*family) return FALSE;
-    if (FAILED(StringCchPrintfW(p->storageDir, ARRAYSIZE(p->storageDir),
-                                L"%s\\Packages\\%s\\LocalCache\\Roaming\\" STOCK_FOLDER, localAppData, family))) {
+    if (!Util_DirExists(parent) ||
+        !Core_PackageCachePath(localAppData, family, L"Roaming", STOCK_FOLDER, p->storageDir, ARRAYSIZE(p->storageDir))) {
         p->storageDir[0] = 0;
         return FALSE;
     }
     return TRUE;
 }
 
-static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isStock)
+static void Fill(Profile *p, const WCHAR *appData, const WCHAR *folder, BOOL isStock, const ClaudePackage *pkg)
 {
-    WCHAR key[MAX_PATH], local[MAX_PATH];
-    ClaudePackage pkg;
+    WCHAR key[MAX_PATH], localAppData[MAX_PATH];
     DWORD color;
     ZeroMemory(p, sizeof *p);
     StringCchCopyW(p->folder, ARRAYSIZE(p->folder), folder);
     if (FAILED(StringCchPrintfW(p->dataDir, ARRAYSIZE(p->dataDir), L"%s\\%s", appData, folder))) p->dataDir[0] = 0;
     p->isStock = isStock;
-    if (isStock && Util_LocalAppData(local, ARRAYSIZE(local)) && Claude_FindPackage(&pkg))
-        Profiles_ResolveStorage(p, local, pkg.family);
+    if (isStock && pkg->found && Util_LocalAppData(localAppData, ARRAYSIZE(localAppData)))
+        Profiles_ResolveStorage(p, localAppData, pkg->family);
     else
         Profiles_ResolveStorage(p, NULL, NULL);
     ProfileKey(folder, key, ARRAYSIZE(key));
-    if (!Util_RegGetString(HKEY_CURRENT_USER, key, L"Name", p->name, ARRAYSIZE(p->name)) || !p->name[0])
+    if (!Util_RegGetString(HKEY_CURRENT_USER, key, VALUE_NAME, p->name, ARRAYSIZE(p->name)) || !p->name[0])
         StringCchCopyW(p->name, ARRAYSIZE(p->name), isStock ? STOCK_DEFAULT_NAME : folder + wcslen(PROFILE_PREFIX));
-    p->color = (Util_RegGetDword(HKEY_CURRENT_USER, key, L"Color", &color) && color < PALETTE_SIZE) ? (int)color : -1;
+    p->color = (Util_RegGetDword(HKEY_CURRENT_USER, key, VALUE_COLOR, &color) && color < PALETTE_SIZE) ? (int)color : -1;
 }
 
-/* Registry entries whose folder was deleted outside the manager. Only a
- * folder that is positively not there counts: a %APPDATA% on an unreachable
- * network share must not erase every name and color. */
+/* The profile's name and color. */
+static void DeleteProfileKey(const WCHAR *folder)
+{
+    WCHAR key[MAX_PATH];
+    LSTATUS status;
+    ProfileKey(folder, key, ARRAYSIZE(key));
+    if ((status = Util_RegDeleteTree(HKEY_CURRENT_USER, key)) != ERROR_SUCCESS)
+        Util_Log(L"could not remove the name and color of %s (error %ld)", folder, status);
+}
+
+/* What the manager keeps for a profile that is gone: its name and color, the
+ * session changes queued for it and the default setting when it names it. A
+ * new profile of that name must not inherit them. */
+static void ForgetProfile(const WCHAR *folder)
+{
+    WCHAR pending[MAX_PATH], defaultFolder[FOLDER_CCH];
+    Profile gone;
+    LSTATUS status;
+    DeleteProfileKey(folder);
+    ZeroMemory(&gone, sizeof gone);
+    StringCchCopyW(gone.folder, ARRAYSIZE(gone.folder), folder);
+    if (SessionStore_PendingPath(&gone, pending, ARRAYSIZE(pending)) && !DeleteFileW(pending) &&
+        GetLastError() != ERROR_FILE_NOT_FOUND && GetLastError() != ERROR_PATH_NOT_FOUND)
+        Util_Log(L"could not delete %s (error %lu)", pending, GetLastError());
+    if (Util_RegGetString(HKEY_CURRENT_USER, REG_ROOT, VALUE_DEFAULT_PROFILE, defaultFolder, ARRAYSIZE(defaultFolder)) &&
+        Core_EqualsI(defaultFolder, folder) &&
+        (status = Util_RegDeleteValue(HKEY_CURRENT_USER, REG_ROOT, VALUE_DEFAULT_PROFILE)) != ERROR_SUCCESS)
+        Util_Log(L"could not stop %s being the default profile (error %ld)", folder, status);
+}
+
+/* Registry entries whose folder was deleted outside the manager, and what
+ * goes with them (ForgetProfile). Only a folder that is positively not there
+ * counts: a %APPDATA% on an unreachable network share must not erase every
+ * name and color. */
 static void PruneMissing(const WCHAR *appData)
 {
-    WCHAR names[MAX_PROFILES * 2][FOLDER_CCH], dir[MAX_PATH], key[MAX_PATH];
+    WCHAR names[MAX_PROFILES * 2][FOLDER_CCH], dir[MAX_PATH];
     HKEY root;
     DWORD i, n = 0, cch;
     if (!Util_DirExists(appData)) return;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PROFILES, 0, KEY_READ, &root) != ERROR_SUCCESS) return;
     for (i = 0; n < ARRAYSIZE(names); i++) {
         LSTATUS rc;
-        cch = FOLDER_CCH;
+        cch = ARRAYSIZE(names[n]);
         rc = RegEnumKeyExW(root, i, names[n], &cch, NULL, NULL, NULL, NULL);
         if (rc == ERROR_MORE_DATA) continue;   /* not a name of ours */
         if (rc != ERROR_SUCCESS) break;        /* the end, or the key was deleted meanwhile */
@@ -90,11 +124,11 @@ static void PruneMissing(const WCHAR *appData)
     }
     RegCloseKey(root);
     for (i = 0; i < n; i++) {
-        if (CompareStringOrdinal(names[i], -1, STOCK_FOLDER, -1, TRUE) == CSTR_EQUAL) continue;
-        if (FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s", appData, names[i]))) continue;
-        if (GetFileAttributesW(dir) != INVALID_FILE_ATTRIBUTES || GetLastError() != ERROR_FILE_NOT_FOUND) continue;
-        ProfileKey(names[i], key, ARRAYSIZE(key));
-        Util_RegDeleteTree(HKEY_CURRENT_USER, key);
+        if (Core_EqualsI(names[i], STOCK_FOLDER)) continue;
+        if (FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s", appData, names[i])) ||
+            Util_QueryPath(dir, NULL) != PATH_MISSING)
+            continue;
+        ForgetProfile(names[i]);
     }
 }
 
@@ -103,71 +137,80 @@ static void PruneMissing(const WCHAR *appData)
  * never recreates its registry key after an uninstall). */
 static void AssignColors(ProfileList *list)
 {
-    BOOL used[PALETTE_SIZE] = { 0 };
-    BOOL persist = Install_IsRegistered();
+    BOOL used[PALETTE_SIZE] = { 0 }, persist = FALSE, persistKnown = FALSE;
     WCHAR key[MAX_PATH];
-    int i, c;
+    int i, color;
     for (i = 0; i < list->count; i++)
         if (list->items[i].color >= 0) used[list->items[i].color] = TRUE;
     for (i = 0; i < list->count; i++) {
         if (list->items[i].color >= 0) continue;
-        for (c = 0; c < PALETTE_SIZE && used[c]; c++) {}
-        if (c == PALETTE_SIZE) c = i % PALETTE_SIZE;
-        used[c] = TRUE;
-        list->items[i].color = c;
+        for (color = 0; color < PALETTE_SIZE && used[color]; color++) {}
+        if (color == PALETTE_SIZE) color = i % PALETTE_SIZE;
+        used[color] = TRUE;
+        list->items[i].color = color;
+        if (!persistKnown) {
+            persist = Install_IsRegistered();
+            persistKnown = TRUE;
+        }
         if (!persist) continue;
         ProfileKey(list->items[i].folder, key, ARRAYSIZE(key));
-        Util_RegSetDword(HKEY_CURRENT_USER, key, L"Color", (DWORD)c);
+        if (!Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_COLOR, (DWORD)color))
+            Util_Log(L"could not save the color of %s (error %lu)", list->items[i].folder, GetLastError());
     }
 }
 
 static int __cdecl CompareProfiles(const void *a, const void *b)
 {
-    const Profile *x = (const Profile *)a, *y = (const Profile *)b;
+    const Profile *first = (const Profile *)a, *second = (const Profile *)b;
     return CompareStringEx(LOCALE_NAME_USER_DEFAULT, NORM_IGNORECASE | SORT_DIGITSASNUMBERS,
-                           x->name, -1, y->name, -1, NULL, NULL, 0) - CSTR_EQUAL;
+                           first->name, -1, second->name, -1, NULL, NULL, 0) - CSTR_EQUAL;
 }
 
-void Profiles_Load(ProfileList *list)
+/* `pkg` locates Main's data when Claude keeps it in its package (NULL: looked up here). */
+void Profiles_Load(ProfileList *list, const ClaudePackage *pkg)
 {
-    WCHAR appData[MAX_PATH], pattern[MAX_PATH], key[MAX_PATH], marker[MAX_PATH];
-    WIN32_FIND_DATAW fd;
-    HANDLE h;
+    WCHAR appData[MAX_PATH], pattern[MAX_PATH], dir[MAX_PATH], key[MAX_PATH], marker[MAX_PATH], defaultFolder[FOLDER_CCH];
+    WIN32_FIND_DATAW entry;
+    ClaudePackage found;
+    HANDLE search;
+    int defaultIndex;
     static BOOL reportedCap;
 
     ZeroMemory(list, sizeof *list);
     StringCchCopyW(list->defaultFolder, ARRAYSIZE(list->defaultFolder), STOCK_FOLDER);
     if (!Util_AppData(appData, ARRAYSIZE(appData))) return;
+    if (!pkg) {
+        Claude_FindPackage(&found);
+        pkg = &found;
+    }
 
-    Fill(&list->items[list->count++], appData, STOCK_FOLDER, TRUE);
+    Fill(&list->items[list->count++], appData, STOCK_FOLDER, TRUE, pkg);
 
     if (SUCCEEDED(StringCchPrintfW(pattern, ARRAYSIZE(pattern), L"%s\\" PROFILE_PREFIX L"*", appData))) {
-        h = FindFirstFileExW(pattern, FindExInfoBasic, &fd, FindExSearchLimitToDirectories, NULL, 0);
-        if (h != INVALID_HANDLE_VALUE) {
+        search = FindFirstFileExW(pattern, FindExInfoBasic, &entry, FindExSearchLimitToDirectories, NULL, 0);
+        if (search != INVALID_HANDLE_VALUE) {
             do {
-                if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-                if (!Core_IsProfileFolder(fd.cFileName)) continue;
-                ProfileKey(fd.cFileName, key, ARRAYSIZE(key));
-                if (FAILED(StringCchPrintfW(marker, ARRAYSIZE(marker), L"%s\\%s\\Local State", appData, fd.cFileName)))
+                if (!(entry.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+                if (!Core_IsProfileFolder(entry.cFileName)) continue;
+                if (FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s", appData, entry.cFileName)) ||
+                    FAILED(StringCchPrintfW(marker, ARRAYSIZE(marker), L"%s\\Local State", dir)))
                     continue;
-                if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
-                    /* A profile moved elsewhere and linked back (junction or
-                     * directory symlink) counts once it reaches a real one. */
-                    if ((fd.dwReserved0 != IO_REPARSE_TAG_MOUNT_POINT && fd.dwReserved0 != IO_REPARSE_TAG_SYMLINK) ||
-                        !Util_FileExists(marker))
-                        continue;
-                } else if (!Util_RegKeyExists(HKEY_CURRENT_USER, key) && !Util_FileExists(marker)) {
-                    continue;   /* neither a Chromium profile nor one created here */
+                if ((entry.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && Util_IsDirectoryLink(dir)) {
+                    /* A profile moved elsewhere and linked back counts once it reaches a real one. */
+                    if (!Util_FileExists(marker)) continue;
+                } else if (!Util_FileExists(marker)) {
+                    ProfileKey(entry.cFileName, key, ARRAYSIZE(key));
+                    if (!Util_RegKeyExists(HKEY_CURRENT_USER, key)) continue;   /* neither a Chromium profile nor one created here */
                 }
                 if (list->count >= MAX_PROFILES) {
                     if (!reportedCap)
-                        Util_Log(L"more than %d profiles: %s and later ones are not listed", MAX_PROFILES, fd.cFileName);
+                        Util_Log(L"more than %d profiles: %s and later ones are not listed", MAX_PROFILES, entry.cFileName);
                     reportedCap = TRUE;
                     break;
                 }
-                Fill(&list->items[list->count++], appData, fd.cFileName, FALSE);
-            } while (FindNextFileW(h, &fd));
-            FindClose(h);
+                Fill(&list->items[list->count++], appData, entry.cFileName, FALSE, pkg);
+            } while (FindNextFileW(search, &entry));
+            FindClose(search);
         }
     }
 
@@ -176,9 +219,9 @@ void Profiles_Load(ProfileList *list)
     if (list->count > 2)
         qsort(list->items + 1, (size_t)(list->count - 1), sizeof(Profile), CompareProfiles);
 
-    if (Util_RegGetString(HKEY_CURRENT_USER, REG_ROOT, L"DefaultProfile", key, FOLDER_CCH) &&
-        Profiles_Find(list, key) >= 0)
-        StringCchCopyW(list->defaultFolder, ARRAYSIZE(list->defaultFolder), list->items[Profiles_Find(list, key)].folder);
+    if (Util_RegGetString(HKEY_CURRENT_USER, REG_ROOT, VALUE_DEFAULT_PROFILE, defaultFolder, ARRAYSIZE(defaultFolder)) &&
+        (defaultIndex = Profiles_Find(list, defaultFolder)) >= 0)
+        StringCchCopyW(list->defaultFolder, ARRAYSIZE(list->defaultFolder), list->items[defaultIndex].folder);
 
     Claude_UpdateRunning(list);
 }
@@ -188,74 +231,98 @@ int Profiles_Find(const ProfileList *list, const WCHAR *folder)
     int i;
     if (!folder || !*folder) return -1;
     for (i = 0; i < list->count; i++)
-        if (CompareStringOrdinal(list->items[i].folder, -1, folder, -1, TRUE) == CSTR_EQUAL) return i;
+        if (Core_EqualsI(list->items[i].folder, folder)) return i;
     return -1;
 }
 
+/* The profile claude:// links open when no Claude runs; -1 for an empty list. */
 int Profiles_DefaultIndex(const ProfileList *list)
 {
     int i = Profiles_Find(list, list->defaultFolder);
-    return i >= 0 ? i : 0;
+    return i >= 0 ? i : list->count > 0 ? 0 : -1;
 }
 
-BOOL Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t folderCch, WCHAR *err, size_t errCch)
+static BOOL WriteNameAndColor(const WCHAR *folder, const WCHAR *name, int color)
 {
-    WCHAR clean[LABEL_CCH], appData[MAX_PATH], dir[MAX_PATH], key[MAX_PATH];
-    const WCHAR *why = NULL;
+    WCHAR key[MAX_PATH];
+    ProfileKey(folder, key, ARRAYSIZE(key));
+    return Util_RegSetString(HKEY_CURRENT_USER, key, VALUE_NAME, name) &&
+           Util_RegSetDword(HKEY_CURRENT_USER, key, VALUE_COLOR, (DWORD)((color >= 0 && color < PALETTE_SIZE) ? color : 0));
+}
 
-    if (!Core_ValidateNewName(name, clean, ARRAYSIZE(clean), folder, folderCch, &why)) {
-        StringCchCopyW(err, errCch, why ? why : L"Invalid name.");
+BOOL Profiles_Create(const WCHAR *name, int color, WCHAR *folder, size_t folderCch, WCHAR *error, size_t errorCch)
+{
+    WCHAR clean[LABEL_CCH], appData[MAX_PATH], dir[MAX_PATH];
+    const WCHAR *invalid = NULL;
+    DWORD lastError;
+
+    if (!Core_ValidateNewName(name, clean, ARRAYSIZE(clean), folder, folderCch, &invalid)) {
+        StringCchCopyW(error, errorCch, TR(invalid));
         return FALSE;
     }
     if (!Util_AppData(appData, ARRAYSIZE(appData)) ||
         FAILED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s", appData, folder))) {
-        StringCchCopyW(err, errCch, L"The Roaming AppData folder is not available.");
+        StringCchCopyW(error, errorCch, TR(L"The Roaming AppData folder is not available."));
         return FALSE;
     }
     if (GetFileAttributesW(dir) != INVALID_FILE_ATTRIBUTES) {
-        StringCchPrintfW(err, errCch, L"A folder named \x201C%s\x201D already exists in %%APPDATA%%.", folder);
+        StringCchPrintfW(error, errorCch, TR(L"A folder named \x201C%s\x201D already exists in %%APPDATA%%."), folder);
         return FALSE;
     }
     if (!CreateDirectoryW(dir, NULL)) {
-        StringCchPrintfW(err, errCch, L"Could not create %s (error %lu).", dir, GetLastError());
+        StringCchPrintfW(error, errorCch, TR(L"Could not create %s (error %lu)."), dir, GetLastError());
         return FALSE;
     }
-    ProfileKey(folder, key, ARRAYSIZE(key));
-    Util_RegSetString(HKEY_CURRENT_USER, key, L"Name", clean);
-    Util_RegSetDword(HKEY_CURRENT_USER, key, L"Color", (DWORD)((color >= 0 && color < PALETTE_SIZE) ? color : 0));
+    /* Without its name in the registry, an empty folder would not be listed
+     * and would still block the name: it goes again. */
+    if (!WriteNameAndColor(folder, clean, color)) {
+        lastError = GetLastError();
+        DeleteProfileKey(folder);
+        if (!RemoveDirectoryW(dir)) Util_Log(L"could not remove %s, which keeps its name taken (error %lu)", dir, GetLastError());
+        StringCchPrintfW(error, errorCch, TR(L"Could not create %s (error %lu)."), dir, lastError);
+        return FALSE;
+    }
     Util_Log(L"created profile %s", folder);
     return TRUE;
 }
 
 BOOL Profiles_Update(const WCHAR *folder, const WCHAR *label, int color)
 {
-    WCHAR clean[LABEL_CCH], key[MAX_PATH];
-    if (!Core_ValidateLabel(label, clean, ARRAYSIZE(clean), NULL)) return FALSE;
-    ProfileKey(folder, key, ARRAYSIZE(key));
-    return Util_RegSetString(HKEY_CURRENT_USER, key, L"Name", clean) &&
-           Util_RegSetDword(HKEY_CURRENT_USER, key, L"Color", (DWORD)((color >= 0 && color < PALETTE_SIZE) ? color : 0));
+    WCHAR clean[LABEL_CCH];
+    return Core_ValidateLabel(label, clean, ARRAYSIZE(clean), NULL) && WriteNameAndColor(folder, clean, color);
 }
 
-void Profiles_SetDefault(const WCHAR *folder)
+BOOL Profiles_SetDefault(const WCHAR *folder)
 {
-    Util_RegSetString(HKEY_CURRENT_USER, REG_ROOT, L"DefaultProfile", folder);
+    if (Util_RegSetString(HKEY_CURRENT_USER, REG_ROOT, VALUE_DEFAULT_PROFILE, folder)) return TRUE;
+    Util_Log(L"could not make %s the default profile (error %lu)", folder, GetLastError());
+    return FALSE;
 }
 
 /* ------------------------------------------------------- settings copy */
 
-#define SETTINGS_MAX (1024 * 1024)
+#define SETTINGS_MAX        (1024 * 1024)
+#define SETTINGS_COPY_SLACK 256   /* what a copy adds to the members it takes: braces, commas, a line end */
+#define NESTED_SETTING_MAX  256   /* the one nested member copied, in an object of its own */
+
+typedef enum SettingsCopy { SETTINGS_COPIED, SETTINGS_NOTHING_TO_COPY, SETTINGS_COPY_FAILED } SettingsCopy;
+static const WCHAR *const kSettingsCopyNames[] = { L"copied", L"nothing to copy", L"FAILED" };
 
 /* `json` (a buffer of `cap` bytes holding *len) with `key` set to the value
- * `raw` of `rawLen` bytes. */
+ * `raw` of `rawLen` bytes; unchanged when it does not fit. */
 static BOOL SetValue(char *json, size_t cap, size_t *len, const char *key, const char *raw, size_t rawLen)
 {
     char *value = (char *)HeapAlloc(GetProcessHeap(), 0, rawLen + 1), *out = (char *)HeapAlloc(GetProcessHeap(), 0, cap);
+    size_t newLen = 0;
     BOOL ok = value && out;
     if (ok) {
         memcpy(value, raw, rawLen);
         value[rawLen] = 0;
-        ok = Core_JsonSetMember(json, *len, key, value, out, cap, len);
-        if (ok) memcpy(json, out, *len);
+        ok = Core_JsonSetMember(json, *len, key, value, out, cap, &newLen);
+        if (ok) {
+            memcpy(json, out, newLen);
+            *len = newLen;
+        }
     }
     if (value) HeapFree(GetProcessHeap(), 0, value);
     if (out) HeapFree(GetProcessHeap(), 0, out);
@@ -264,43 +331,73 @@ static BOOL SetValue(char *json, size_t cap, size_t *len, const char *key, const
 
 /* Writes the members `keys` of the file `name` of one data folder to the
  * same file of another one, which must not exist yet. `nestedIn` puts
- * `nestedKey` under that object (for preferences). */
-static BOOL CopyMembers(const WCHAR *fromDir, const WCHAR *toDir, const WCHAR *name,
-                        const char *const *keys, size_t count, const char *nestedIn, const char *nestedKey)
+ * `nestedKey` under that object (for preferences). SETTINGS_NOTHING_TO_COPY
+ * when the file or every member is missing; a failure is logged. */
+static SettingsCopy CopyMembers(const WCHAR *fromDir, const WCHAR *toDir, const WCHAR *name,
+                                const char *const *keys, size_t count, const char *nestedIn, const char *nestedKey)
 {
     WCHAR from[MAX_PATH], to[MAX_PATH];
-    char *src, *out, wrapped[256];
-    const char *v, *inner;
-    size_t vl, il, i, cap, o = 2, wl = 2;
-    DWORD len = 0, written = 0;
-    HANDLE h;
-    BOOL ok = FALSE, any = FALSE;
+    char *source, *copy, wrapped[NESTED_SETTING_MAX];
+    const char *value, *nested;
+    size_t valueLength, nestedLength, i, cap, copyLength = 2, wrappedLength = 2;
+    DWORD sourceLength = 0, written = 0;
+    HANDLE file;
+    SettingsCopy outcome = SETTINGS_COPY_FAILED;
+    BOOL any = FALSE;
     if (FAILED(StringCchPrintfW(from, ARRAYSIZE(from), L"%s\\%s", fromDir, name)) ||
-        FAILED(StringCchPrintfW(to, ARRAYSIZE(to), L"%s\\%s", toDir, name)) || Util_FileExists(to))
-        return FALSE;
-    if ((src = Util_ReadFile(from, SETTINGS_MAX, FALSE, &len)) == NULL) return FALSE;
-    cap = (size_t)len + 256;
-    if ((out = (char *)HeapAlloc(GetProcessHeap(), 0, cap)) != NULL) {
-        memcpy(out, "{}", 2);
+        FAILED(StringCchPrintfW(to, ARRAYSIZE(to), L"%s\\%s", toDir, name))) {
+        Util_Log(L"settings not copied: a path to %s is too long", name);
+        return SETTINGS_COPY_FAILED;
+    }
+    if (Util_QueryPath(from, NULL) == PATH_MISSING) return SETTINGS_NOTHING_TO_COPY;
+    if (Util_FileExists(to)) {
+        Util_Log(L"settings not copied: %s is there already", to);
+        return SETTINGS_COPY_FAILED;
+    }
+    if ((source = Util_ReadFile(from, SETTINGS_MAX, FALSE, &sourceLength)) == NULL) {
+        Util_Log(L"settings not copied: %s cannot be read whole", from);
+        return SETTINGS_COPY_FAILED;
+    }
+    cap = (size_t)sourceLength + SETTINGS_COPY_SLACK;
+    if ((copy = (char *)HeapAlloc(GetProcessHeap(), 0, cap)) == NULL) {
+        Util_Log(L"settings not copied to %s: out of memory", to);
+    } else {
+        /* Room is kept for the line end. */
+        memcpy(copy, "{}", 2);
         for (i = 0; i < count; i++)
-            if (Core_JsonMember(src, len, keys[i], &v, &vl) && SetValue(out, cap, &o, keys[i], v, vl)) any = TRUE;
-        if (nestedIn && Core_JsonMember(src, len, nestedIn, &inner, &il) && Core_JsonMember(inner, il, nestedKey, &v, &vl)) {
+            if (Core_JsonMember(source, sourceLength, keys[i], &value, &valueLength) &&
+                SetValue(copy, cap - 1, &copyLength, keys[i], value, valueLength))
+                any = TRUE;
+        if (nestedIn && Core_JsonMember(source, sourceLength, nestedIn, &nested, &nestedLength) &&
+            Core_JsonMember(nested, nestedLength, nestedKey, &value, &valueLength)) {
             memcpy(wrapped, "{}", 2);
-            if (SetValue(wrapped, sizeof wrapped, &wl, nestedKey, v, vl) && SetValue(out, cap, &o, nestedIn, wrapped, wl)) any = TRUE;
+            if (SetValue(wrapped, sizeof wrapped, &wrappedLength, nestedKey, value, valueLength) &&
+                SetValue(copy, cap - 1, &copyLength, nestedIn, wrapped, wrappedLength))
+                any = TRUE;
         }
-        if (any && o + 1 < cap) {
-            out[o++] = '\n';
-            h = CreateFileW(to, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (h != INVALID_HANDLE_VALUE) {
-                ok = WriteFile(h, out, (DWORD)o, &written, NULL) && written == (DWORD)o;
-                CloseHandle(h);
-                if (!ok) DeleteFileW(to);
+        if (!any) {
+            outcome = SETTINGS_NOTHING_TO_COPY;
+        } else {
+            copy[copyLength++] = '\n';
+            file = CreateFileW(to, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (file == INVALID_HANDLE_VALUE) {
+                Util_Log(L"settings not copied: %s cannot be created (error %lu)", to, GetLastError());
+            } else {
+                BOOL whole = WriteFile(file, copy, (DWORD)copyLength, &written, NULL) && written == (DWORD)copyLength;
+                DWORD error = GetLastError();
+                CloseHandle(file);
+                if (whole) {
+                    outcome = SETTINGS_COPIED;
+                } else {
+                    Util_Log(L"settings not copied: %s cannot be written (error %lu)", to, error);
+                    DeleteFileW(to);
+                }
             }
         }
-        HeapFree(GetProcessHeap(), 0, out);
+        HeapFree(GetProcessHeap(), 0, copy);
     }
-    HeapFree(GetProcessHeap(), 0, src);
-    return ok;
+    HeapFree(GetProcessHeap(), 0, source);
+    return outcome;
 }
 
 /* A new profile starts with the settings of another one that are not tied to
@@ -310,28 +407,33 @@ void Profiles_CopySettings(const Profile *from, const Profile *to)
 {
     static const char *const desktop[] = { "mcpServers", "isHardwareAccelerationDisabled" };
     static const char *const app[] = { "locale", "userThemeMode" };
-    BOOL a, b;
+    SettingsCopy desktopOutcome, appOutcome;
     if (!from->storageDir[0] || !to->storageDir[0]) {
         Util_Log(L"could not copy settings of %s to %s: profile storage is unavailable", from->folder, to->folder);
         return;
     }
-    a = CopyMembers(from->storageDir, to->storageDir, L"claude_desktop_config.json", desktop, ARRAYSIZE(desktop),
-                    "preferences", "menuBarEnabled");
-    b = CopyMembers(from->storageDir, to->storageDir, L"config.json", app, ARRAYSIZE(app), NULL, NULL);
-    Util_Log(L"copied settings of %s to %s (%d, %d)", from->folder, to->folder, a, b);
+    desktopOutcome = CopyMembers(from->storageDir, to->storageDir, CLAUDE_DESKTOP_SETTINGS, desktop, ARRAYSIZE(desktop),
+                                 "preferences", "menuBarEnabled");
+    appOutcome = CopyMembers(from->storageDir, to->storageDir, CLAUDE_APP_SETTINGS, app, ARRAYSIZE(app), NULL, NULL);
+    Util_Log(L"settings of %s for %s: desktop settings %s, app settings %s", from->folder, to->folder,
+             kSettingsCopyNames[desktopOutcome], kSettingsCopyNames[appOutcome]);
 }
 
+/* The profile's folder is a junction or directory symlink to one elsewhere. */
 BOOL Profiles_IsLinked(const Profile *profile)
 {
-    DWORD attr = GetFileAttributesW(profile->dataDir);
-    return attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT);
+    return Util_IsDirectoryLink(profile->dataDir);
 }
 
 /* One profile folder to the Recycle Bin (a file of that name is not one). */
-static RemoveResult Recycle(HWND owner, const WCHAR *path)
+static RemoveResult Recycle(HWND owner, const Profile *profile, const WCHAR *path)
 {
-    DWORD attr = GetFileAttributesW(path);
-    if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) return REMOVE_DONE;
+    DWORD attributes;
+    if (Claude_IsRunning(profile)) {
+        Util_Log(L"kept %s: its Claude is running", path);
+        return REMOVE_FAILED;
+    }
+    if (Util_QueryPath(path, &attributes) == PATH_PRESENT && !(attributes & FILE_ATTRIBUTE_DIRECTORY)) return REMOVE_DONE;
     return Util_Recycle(owner, &path, 1);
 }
 
@@ -339,72 +441,69 @@ static RemoveResult Recycle(HWND owner, const WCHAR *path)
  * FALSE when it is a plain folder or the target cannot be resolved. */
 BOOL Profiles_LinkTarget(const Profile *profile, WCHAR *out, size_t cch)
 {
-    WCHAR buf[MAX_PATH + 8];
-    const WCHAR *p = buf;
-    DWORD attr = GetFileAttributesW(profile->dataDir), n;
-    HANDLE h;
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_REPARSE_POINT)) return FALSE;
-    h = CreateFileW(profile->dataDir, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (h == INVALID_HANDLE_VALUE) return FALSE;
-    n = GetFinalPathNameByHandleW(h, buf, ARRAYSIZE(buf), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
-    CloseHandle(h);
-    if (n == 0 || n >= ARRAYSIZE(buf)) return FALSE;
+    WCHAR finalPath[MAX_PATH + 8];
+    const WCHAR *p = finalPath;
+    DWORD n;
+    HANDLE folder;
+    if (!Util_IsDirectoryLink(profile->dataDir)) return FALSE;
+    folder = CreateFileW(profile->dataDir, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING,
+                         FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (folder == INVALID_HANDLE_VALUE) return FALSE;
+    n = GetFinalPathNameByHandleW(folder, finalPath, ARRAYSIZE(finalPath), FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+    CloseHandle(folder);
+    if (n == 0 || n >= ARRAYSIZE(finalPath)) return FALSE;
     if (wcsncmp(p, L"\\\\?\\UNC\\", 8) == 0) return SUCCEEDED(StringCchPrintfW(out, cch, L"\\\\%s", p + 8));
     if (wcsncmp(p, L"\\\\?\\", 4) == 0) p += 4;
     return SUCCEEDED(StringCchCopyW(out, cch, p));
 }
 
-/* The data folder, then what Claude keeps for the profile in %LOCALAPPDATA%
- * (logs, "<folder>-Data") and in its package's LocalCache\\Local and \\Roaming,
- * where Claude's own writes land when the folder did not exist yet (see
- * claude.c). Each location is handled on its own and skipped once gone. */
+/* What Claude keeps for the profile in %LOCALAPPDATA% (logs, "<folder>-Data")
+ * and in its package's LocalCache\Local and \Roaming, where Claude's own
+ * writes land when the folder did not exist yet (see claude.c), then the data
+ * folder. Each location is handled on its own and skipped once gone; the data
+ * folder goes last, so a profile left half removed is still listed and its
+ * removal can be tried again. */
 RemoveResult Profiles_RecycleData(HWND owner, const Profile *profile)
 {
     static const WCHAR *const suffixes[] = { L"", L"-Data" };
-    WCHAR local[MAX_PATH], p[MAX_PATH];
+    WCHAR appData[MAX_PATH], localAppData[MAX_PATH], path[MAX_PATH], name[FOLDER_CCH + 8];
     ClaudePackage pkg;
-    BOOL havePkg;
-    RemoveResult r;
+    BOOL havePackage;
+    RemoveResult result;
     size_t i;
 
     if (profile->isStock) return REMOVE_FAILED;
     /* A %APPDATA% on a disconnected drive can also answer "path not found". */
-    if (!Util_AppData(local, ARRAYSIZE(local)) || !Util_DirExists(local)) return REMOVE_FAILED;
-    r = Recycle(owner, profile->dataDir);
-    if (r != REMOVE_DONE) return r;
-    if (Util_LocalAppData(local, ARRAYSIZE(local))) {
-        havePkg = Claude_FindPackage(&pkg);
-        for (i = 0; i < ARRAYSIZE(suffixes); i++) {
-            if (SUCCEEDED(StringCchPrintfW(p, ARRAYSIZE(p), L"%s\\%s%s", local, profile->folder, suffixes[i])))
-                Recycle(owner, p);
-            if (havePkg && SUCCEEDED(StringCchPrintfW(p, ARRAYSIZE(p), L"%s\\Packages\\%s\\LocalCache\\Local\\%s%s",
-                                                      local, pkg.family, profile->folder, suffixes[i])))
-                Recycle(owner, p);
+    if (!Util_AppData(appData, ARRAYSIZE(appData)) || !Util_DirExists(appData)) return REMOVE_FAILED;
+    if (!Util_LocalAppData(localAppData, ARRAYSIZE(localAppData))) return REMOVE_FAILED;
+    havePackage = Claude_FindPackage(&pkg);
+    for (i = 0; i < ARRAYSIZE(suffixes); i++) {
+        if (FAILED(StringCchPrintfW(name, ARRAYSIZE(name), L"%s%s", profile->folder, suffixes[i])) ||
+            FAILED(StringCchPrintfW(path, ARRAYSIZE(path), L"%s\\%s", localAppData, name))) return REMOVE_FAILED;
+        if ((result = Recycle(owner, profile, path)) != REMOVE_DONE) return result;
+        if (havePackage) {
+            if (!Core_PackageCachePath(localAppData, pkg.family, L"Local", name, path, ARRAYSIZE(path))) return REMOVE_FAILED;
+            if ((result = Recycle(owner, profile, path)) != REMOVE_DONE) return result;
         }
-        if (havePkg &&
-            SUCCEEDED(StringCchPrintfW(p, ARRAYSIZE(p), L"%s\\Packages\\%s\\LocalCache\\Roaming\\%s", local, pkg.family, profile->folder)))
-            Recycle(owner, p);
     }
+    if (havePackage) {
+        if (!Core_PackageCachePath(localAppData, pkg.family, L"Roaming", profile->folder, path, ARRAYSIZE(path))) return REMOVE_FAILED;
+        if ((result = Recycle(owner, profile, path)) != REMOVE_DONE) return result;
+    }
+    if ((result = Recycle(owner, profile, profile->dataDir)) != REMOVE_DONE) return result;
     Util_Log(L"recycled profile data %s", profile->dataDir);
     return REMOVE_DONE;
 }
 
 RemoveResult Profiles_Delete(HWND owner, const Profile *profile)
 {
-    WCHAR key[MAX_PATH], def[FOLDER_CCH], pending[MAX_PATH];
-    RemoveResult r;
+    RemoveResult result;
     if (profile->isStock) return REMOVE_FAILED;
-    r = Profiles_RecycleData(owner, profile);
-    if (r != REMOVE_DONE) return r;
+    result = Profiles_RecycleData(owner, profile);
+    if (result != REMOVE_DONE) return result;
     Shortcut_RemoveOurs(profile);
     Icons_DeleteStale(profile, NULL);
-    if (SessionStore_PendingPath(profile, pending, ARRAYSIZE(pending))) DeleteFileW(pending);
-    ProfileKey(profile->folder, key, ARRAYSIZE(key));
-    Util_RegDeleteTree(HKEY_CURRENT_USER, key);
-    if (Util_RegGetString(HKEY_CURRENT_USER, REG_ROOT, L"DefaultProfile", def, ARRAYSIZE(def)) &&
-        CompareStringOrdinal(def, -1, profile->folder, -1, TRUE) == CSTR_EQUAL)
-        Util_RegDeleteValue(HKEY_CURRENT_USER, REG_ROOT, L"DefaultProfile");
+    ForgetProfile(profile->folder);
     Util_Log(L"deleted profile %s", profile->folder);
     return REMOVE_DONE;
 }

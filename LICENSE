@@ -22,26 +22,24 @@ defined below.
 The following components are excluded from the open source license above and
 are subject to a separate commercial license:
 
-- The files `src/taskbar-pin.c` and `src/taskbar.c` and all their functions
-- Code directly responsible for writing to the Windows Taskband registry,
-  constructing, repairing or updating PIDL blob entries, injecting BEEF001D
-  extension blocks, or acquiring the `TaskbarPinListMutex` system mutex
-- Code directly responsible for setting window AppUserModel properties to
-  control taskbar buttons, refreshing taskbar icons through shell change
-  notifications, or detecting snap groups
-- Anything for the purpose of programmatic taskbar pinning or of controlling
-  the taskbar's buttons, pins and icons
+- The files `src/taskbar-pin.c` and `src/taskbar.c`, in whole or in part
+- Any work derived from them, in any programming language, including code
+  that reproduces the way they pin programs to the taskbar, change its pins
+  or control its buttons and icons
 
 Collectively referred to as the "Taskbar Module."
 
-The notification-area code (`src/tray.c`) is not part of the Taskbar Module:
-it is under the open source license above.
+All other files of the Software are under the open source license above,
+including the code that works alongside the Taskbar Module: shortcuts and
+their AppUserModelIDs (`src/shortcuts.c`), the profile icons and badges
+(`src/icons.c`), the notification-area icon (`src/tray.c`) and the manager
+window (`src/gui.c`).
 
 ### Permitted Use (Free)
 
 The Taskbar Module may be used free for:
 
-- Personal, non-commercial use
+- Personal use by an individual, not on behalf of a company
 - Educational and academic purposes
 - Open source projects
 - Evaluation and testing
@@ -51,6 +49,9 @@ The Taskbar Module may be used free for:
 A paid commercial license is required to use the Taskbar Module in
 any of the following contexts:
 
+- Enterprise use: use by or within a company, including by its employees or
+  contractors for their work and on the company's computers, other than for
+  evaluation and testing
 - Commercial software products (sold, licensed, or distributed for revenue)
 - SaaS platforms, managed services, or hosted applications
 - Any product or service generating direct or indirect revenue

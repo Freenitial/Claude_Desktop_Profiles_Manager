@@ -26,7 +26,8 @@ jobs:
           $version = [regex]::Match((Get-Content src/version.h -Raw), 'APP_VERSION_STR\s+"([^"]+)"').Groups[1].Value
           if ("v$version" -ne $env:GITHUB_REF_NAME) { throw "Tag $env:GITHUB_REF_NAME does not match APP_VERSION_STR ""$version"" in src/version.h" }
 
-      - name: Build and run the unit tests
+      # The version numbers must match APP_VERSION_STR too: test_core checks it.
+      - name: Build, check the interface catalogs and run the unit tests
         shell: cmd
         run: build.cmd
 
@@ -35,4 +36,3 @@ jobs:
           name: ClaudeDesktopProfilesManager
           path: build/ClaudeDesktopProfilesManager.exe
           if-no-files-found: error
-

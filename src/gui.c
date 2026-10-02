@@ -8,189 +8,260 @@
 #include "app.h"
 #include "resource.h"
 #include <commctrl.h>
-#include <knownfolders.h>
 #include <shlobj.h>
-#include <shobjidl.h>
 #include <shellapi.h>
 
-#define WM_APP_UNINSTALL (WM_APP + 1)
-#define WM_APP_RELAYOUT  (WM_APP + 2)
-#define WM_APP_FIXFOCUS  (WM_APP + 3)
-#define WM_APP_DPI       (WM_APP + 4)   /* a dialog moved to a monitor with another scale */
-#define WM_APP_SHOW      (WM_APP + 5)   /* a second launch asked for the manager itself */
-#define WM_APP_SETUPLINKS (WM_APP + 6)  /* just installed: offer to set up claude:// links */
-#define WM_APP_UPDATE     (WM_APP + 7)  /* the latest release is known */
-#define WM_APP_DOWNLOADED (WM_APP + 8)  /* wParam: how the download went (UpdateResult) */
-#define WM_APP_SELECTION  (WM_APP + 9)  /* the list selection changed */
-#define WM_APP_SHORTCUTS  (WM_APP + 10) /* the desktop, Start menu or taskbar pins folder changed */
-#define WM_APP_OUTSIDE    (WM_APP + 11) /* something the window shows changed outside it (g_outside) */
+#define WM_APP_UNINSTALL       (WM_APP + 1)
+#define WM_APP_RELAYOUT        (WM_APP + 2)
+#define WM_APP_RESTORE_FOCUS   (WM_APP + 3)   /* back to the window: the focus may be on a control the refresh hid */
+#define WM_APP_FIT_NAMES       (WM_APP + 4)   /* a dialog was fitted (opened, or moved to another scale): cut names to it */
+#define WM_APP_SHOW            (WM_APP + 5)   /* a second launch asked for the manager itself */
+#define WM_APP_SETUPLINKS      (WM_APP + 6)   /* just installed: offer to set up claude:// links */
+#define WM_APP_UPDATE          (WM_APP + 7)   /* the latest release is known */
+#define WM_APP_DOWNLOADED      (WM_APP + 8)   /* wParam: how the download went (UpdateResult), lParam: Windows' error */
+#define WM_APP_SELECTION       (WM_APP + 9)   /* the list selection changed */
+#define WM_APP_SHORTCUTS       (WM_APP + 10)  /* the desktop, Start menu or taskbar pins folder changed */
+#define WM_APP_OUTSIDE         (WM_APP + 11)  /* something the window shows changed outside it (g_outside) */
+#define WM_APP_SHORTCUTS_CHECK (WM_APP + 14)  /* once for a burst of WM_APP_SHORTCUTS (12 and 13 are the sessions view's) */
+
+#define ROW_ICON_DIPS         24   /* a taskbar button's icon size, so the initial shows in the row's badge */
+#define GROUP_BADGE_GAP_DIPS  5    /* between the "Shortcuts for" badge and its text */
+#define GROUP_BADGE_OVERHANG  2    /* pixels the badge is taller than the label's capitals */
+#define PREVIEW_ICON_DIPS     32   /* the profile dialog's icon */
+#define FIRST_COLUMN_WIDTH    60   /* any: Gui_LayoutProfileColumns sizes the columns */
+
+/* Set once the manager's window exists: a second launch waits for it while
+ * the first one still repairs its install. */
+#define MANAGER_READY_EVENT      L"Local\\ClaudeDesktopProfilesManager.ManagerReady"
+#define MANAGER_READY_TIMEOUT_MS 15000
+#define SHELL_WORK_WAIT_MS       60000   /* the language's shortcuts and pins take about a second */
 
 /* What changed outside the window, told by the thread that waits for it. */
-enum { CHANGE_PROFILES = 1, CHANGE_LINKS = 2, CHANGE_PACKAGES = 4 };
+enum { CHANGE_PROFILES = 1, CHANGE_LINKS = 2, CHANGE_PACKAGES = 4, CHANGE_PINS = 8 };
 
-typedef enum FixAction { FIX_NONE, FIX_GET_CLAUDE, FIX_LINKS } FixAction;
+/* What the button beside the status does (IDC_STATUS_ACTION). */
+typedef enum StatusAction { STATUS_ACTION_NONE, STATUS_ACTION_GET_CLAUDE, STATUS_ACTION_SET_UP_LINKS } StatusAction;
 
 typedef struct MainState {
-    HWND        dlg;
-    HWND        list, listArea;   /* the profiles list, and the view it scrolls in */
-    ProfileList profiles;
+    HWND         dlg;
+    HWND         list;
+    ProfileList  profiles;
     ClaudePackage pkg;
-    FixAction   fix;
-    WCHAR       checkedFolder[FOLDER_CCH]; /* profile whose shortcut and pin state is cached */
-    BOOL        onDesktop;
-    BOOL        pinned;
-    BOOL        inStartMenu;
-    ULONG       shortcutsNotify;  /* SHChangeNotifyRegister on the folders those buttons read */
-    int         groupColor;       /* badge shown in the "Shortcuts for" label */
-    HANDLE      outsideThread;    /* waits for outside changes (WatchOutside) */
-    HANDLE      outsideStop;
-    HICON       bigIcon;
-    HICON       smallIcon;
-    BOOL        uninstalled;      /* nothing may touch the registry any more */
-    BOOL        busy;             /* uninstall in progress: no refresh */
-    BOOL        closing;          /* asked to close (installer update) */
-    BOOL        pendingUninstall; /* uninstall asked while a dialog was open */
-    BOOL        uninstallOnly;    /* started from Settings to uninstall: no manager window */
-    BOOL        updating;         /* the newer release is downloading or installing */
-    BOOL        selectionPending; /* WM_APP_SELECTION posted */
+    StatusAction statusAction;
+    WCHAR        shortcutStateFolder[FOLDER_CCH]; /* profile whose shortcut and pin state is cached */
+    BOOL         onDesktop;
+    BOOL         pinned;
+    BOOL         inStartMenu;
+    ULONG        shortcutsNotify;  /* SHChangeNotifyRegister on the folders those buttons read */
+    int          groupColor;       /* badge shown in the "Shortcuts for" label */
+    HICON        groupBadge;       /* that badge as last drawn, in groupBadgeColor at groupBadgeSize pixels */
+    int          groupBadgeColor;
+    int          groupBadgeSize;
+    HANDLE       outsideThread;    /* waits for outside changes (WatchOutside) */
+    HANDLE       outsideStop;
+    HANDLE       readyEvent;       /* MANAGER_READY_EVENT */
+    HICON        bigIcon;
+    HICON        smallIcon;
+    BOOL         uninstalled;      /* nothing may touch the registry any more */
+    BOOL         uninstallInProgress; /* its dialog or the uninstall itself: no refresh */
+    BOOL         closing;          /* asked to close (installer update) */
+    BOOL         pendingUninstall; /* uninstall asked while a dialog was open */
+    BOOL         pendingSetUpLinks; /* links setup asked while a dialog was open */
+    BOOL         uninstallOnly;    /* started from Settings to uninstall: no manager window */
+    BOOL         updating;         /* the newer release is downloading or installing */
+    BOOL         installing;
+    BOOL         selectionPending; /* WM_APP_SELECTION posted */
+    BOOL         shortcutsCheckPending; /* WM_APP_SHORTCUTS_CHECK posted */
+    BOOL         layoutReady, layingOut;
+    HANDLE       shellWork;        /* the thread writing shortcuts and pins in a new language */
 } MainState;
 
-static MainState g;
+static MainState g_manager;
 static volatile LONG g_outside;   /* CHANGE_* not handled yet: set by the thread, taken by the window */
-
-static BOOL Same(const WCHAR *a, const WCHAR *b)
-{
-    return CompareStringOrdinal(a, -1, b, -1, TRUE) == CSTR_EQUAL;
-}
 
 /* While uninstalling or closing, nothing may reload state or write the
  * registry. */
-static BOOL Quiet(void)
+static BOOL StateChangesBlocked(void)
 {
-    return g.uninstalled || g.busy || g.closing;
+    return g_manager.uninstalled || g_manager.uninstallInProgress || g_manager.closing;
 }
 
-static const Profile *Selected(void)
+static const Profile *SelectedProfile(void)
 {
-    int i = ListView_GetNextItem(g.list, -1, LVNI_SELECTED);
-    return (i >= 0 && i < g.profiles.count) ? &g.profiles.items[i] : NULL;
+    int i = ListView_GetNextItem(g_manager.list, -1, LVNI_SELECTED);
+    return (i >= 0 && i < g_manager.profiles.count) ? &g_manager.profiles.items[i] : NULL;
 }
 
-static const WCHAR *StockName(void)
+static const WCHAR *StockProfileName(void)
 {
-    int i = Profiles_Find(&g.profiles, STOCK_FOLDER);
-    return i >= 0 ? g.profiles.items[i].name : STOCK_DEFAULT_NAME;
+    int i = Profiles_Find(&g_manager.profiles, STOCK_FOLDER);
+    return i >= 0 ? g_manager.profiles.items[i].name : STOCK_DEFAULT_NAME;
 }
 
-static void Enable(int id, BOOL on)
+/* A control turned off while it has the focus gives it to the next one. */
+static void EnableControl(int id, BOOL enabled)
 {
-    HWND w = GetDlgItem(g.dlg, id);
-    if (!on && GetFocus() == w) SendMessageW(g.dlg, WM_NEXTDLGCTL, 0, FALSE);
-    EnableWindow(w, on);
+    HWND control = GetDlgItem(g_manager.dlg, id);
+    if (!enabled && GetFocus() == control) SendMessageW(g_manager.dlg, WM_NEXTDLGCTL, 0, FALSE);
+    EnableWindow(control, enabled);
 }
 
 static void SetTextIfChanged(int id, const WCHAR *text)
 {
-    WCHAR now[512];
-    GetDlgItemTextW(g.dlg, id, now, ARRAYSIZE(now));
-    if (wcscmp(now, text) != 0) SetDlgItemTextW(g.dlg, id, text);
+    WCHAR current[512];
+    GetDlgItemTextW(g_manager.dlg, id, current, ARRAYSIZE(current));
+    if (wcscmp(current, text) != 0) SetDlgItemTextW(g_manager.dlg, id, text);
+}
+
+/* Posts `message` unless it already waits in the queue: a burst of events
+ * is handled once. */
+static void PostOnce(BOOL *pending, UINT message)
+{
+    if (*pending) return;
+    *pending = TRUE;
+    PostMessageW(g_manager.dlg, message, 0, 0);
+}
+
+static void LayoutMainControls(void);
+
+/* The status action and Update buttons take room only while they show: the
+ * window is laid out again when one of them appears or goes. */
+static void ShowOptionalButton(int id, BOOL shown)
+{
+    HWND button = GetDlgItem(g_manager.dlg, id);
+    if (((GetWindowLongW(button, GWL_STYLE) & WS_VISIBLE) != 0) == shown) return;
+    ShowWindow(button, shown ? SW_SHOW : SW_HIDE);
+    LayoutMainControls();
+}
+
+/* The focus and the default button of the view shown: the profiles list and
+ * Open, or the sessions tree and IDOK (SessionsView_Command opens the
+ * session). */
+static void FocusView(HWND dialog, BOOL sessions)
+{
+    SendMessageW(dialog, WM_NEXTDLGCTL, (WPARAM)GetDlgItem(dialog, sessions ? IDC_S_TREE : IDC_LIST), TRUE);
+    SendMessageW(dialog, DM_SETDEFID, sessions ? IDOK : IDC_OPEN, 0);
 }
 
 /* ------------------------------------------------------------------ list */
 
-static void RoleText(const Profile *p, WCHAR *out, size_t cch)
-{
-    BOOL def = Same(p->folder, g.profiles.defaultFolder);
-    if (p->isStock && def)
-        StringCchCopyW(out, cch, L"Claude icon, default");
-    else if (p->isStock)
-        StringCchCopyW(out, cch, L"Claude icon");
-    else if (def)
-        StringCchCopyW(out, cch, L"Default");
-    else
-        out[0] = 0;
-}
-
 static void UpdateRow(int i)
 {
-    const Profile *p = &g.profiles.items[i];
+    const Profile *p = &g_manager.profiles.items[i];
     WCHAR text[MAX_PATH];
-    ListView_SetItemText(g.list, i, 0, (LPWSTR)p->name);
-    RoleText(p, text, ARRAYSIZE(text));
-    ListView_SetItemText(g.list, i, 1, text);
+    ListView_SetItemText(g_manager.list, i, 0, (LPWSTR)p->name);
+    ListView_SetItemText(g_manager.list, i, 1,
+                         (LPWSTR)TR(Theme_ProfileRole(p->isStock, Core_EqualsI(p->folder, g_manager.profiles.defaultFolder))));
     StringCchPrintfW(text, ARRAYSIZE(text), L"%%APPDATA%%\\%s", p->folder);
-    ListView_SetItemText(g.list, i, 2, text);
+    ListView_SetItemText(g_manager.list, i, 2, text);
 }
 
-/* The size of a taskbar button's icon, so the initial shows in the badge. */
 static int IconPixels(void)
 {
-    return MulDiv(24, (int)GetDpiForWindow(g.dlg), 96);
+    return MulDiv(ROW_ICON_DIPS, (int)GetDpiForWindow(g_manager.dlg), 96);
 }
 
-static void RebuildImages(void)
+/* Each row's image, I_IMAGENONE for a profile whose icon could not be made. */
+static void RebuildImages(int *rowImages)
 {
-    int px = IconPixels(), i;
-    HIMAGELIST il = ImageList_Create(px, px, ILC_COLOR32, g.profiles.count, 1), old;
-    if (!il) return;
-    for (i = 0; i < g.profiles.count; i++) {
-        HICON icon = Icons_Create(&g.pkg, &g.profiles.items[i], px);
-        if (!icon) icon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, px, px, 0);
-        ImageList_AddIcon(il, icon);
-        if (icon) DestroyIcon(icon);
+    int pixels = IconPixels(), i;
+    HIMAGELIST images = ImageList_Create(pixels, pixels, ILC_COLOR32, g_manager.profiles.count, 1), previous;
+    for (i = 0; i < g_manager.profiles.count; i++) rowImages[i] = I_IMAGENONE;
+    if (!images) return;
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        HICON icon = Icons_Create(&g_manager.pkg, &g_manager.profiles.items[i], pixels);
+        if (!icon) icon = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON, pixels, pixels, 0);
+        if (icon) {
+            int added = ImageList_AddIcon(images, icon);
+            if (added >= 0) rowImages[i] = added;
+            DestroyIcon(icon);
+        }
     }
-    old = ListView_SetImageList(g.list, il, LVSIL_SMALL);
-    if (old) ImageList_Destroy(old);
+    previous = ListView_SetImageList(g_manager.list, images, LVSIL_SMALL);
+    if (previous) ImageList_Destroy(previous);
+}
+
+/* Default widths are independent of profile names and the selected language.
+ * A user's adjustments persist; the data column follows the available space
+ * (the window's minimum size keeps it at least its own minimum). */
+void Gui_LayoutProfileColumns(HWND list)
+{
+    int profileWidth, roleWidth, dataMinimum;
+    int actualProfile = ListView_GetColumnWidth(list, 0), actualRole = ListView_GetColumnWidth(list, 1);
+    Theme_ProfileColumnWidths(list, &profileWidth, &roleWidth, &dataMinimum);
+    if (Theme_ColumnResizeIsManual(list, 0)) profileWidth = actualProfile;
+    if (Theme_ColumnResizeIsManual(list, 1)) roleWidth = actualRole;
+    Theme_SetColumnWidth(list, 0, profileWidth);
+    Theme_SetColumnWidth(list, 1, roleWidth);
+    /* The data column: the rest, never narrower than the data folder (past it, the list scrolls sideways). */
+    Theme_FitLastColumn(list, dataMinimum);
 }
 
 static void LayoutColumns(void)
 {
-    RECT rc;
-    int w;
-    GetClientRect(g.list, &rc);
-    w = rc.right - rc.left;
-    ListView_SetColumnWidth(g.list, 0, w * 27 / 100);
-    ListView_SetColumnWidth(g.list, 1, w * 23 / 100);
-    ListView_SetColumnWidth(g.list, 2, w - (w * 27 / 100) - (w * 23 / 100));
+    Gui_LayoutProfileColumns(g_manager.list);
 }
 
 static void UpdateButtons(void);
+static void FinishShellWork(void);
+static void UpdateNote(void);
+static void ReflowMain(void);
+static void ShowVersion(void);
 
-static void FillList(const WCHAR *select)
+/* Selects the row of `folder`, else the first one: its index, -1 in an
+ * empty list. */
+static int SetSelectedRow(const WCHAR *folder)
 {
-    LVITEMW it;
-    int i, sel = -1;
-    SendMessageW(g.list, WM_SETREDRAW, FALSE, 0);
-    ListView_DeleteAllItems(g.list);
-    RebuildImages();
-    for (i = 0; i < g.profiles.count; i++) {
-        ZeroMemory(&it, sizeof it);
-        it.mask = LVIF_TEXT | LVIF_IMAGE;
-        it.iItem = i;
-        it.iImage = i;
-        it.pszText = g.profiles.items[i].name;
-        ListView_InsertItem(g.list, &it);
-        UpdateRow(i);
-        if (select && Same(g.profiles.items[i].folder, select)) sel = i;
-    }
-    if (sel < 0 && g.profiles.count > 0) sel = 0;
-    if (sel >= 0) {
-        ListView_SetItemState(g.list, sel, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
-        ListView_EnsureVisible(g.list, sel, FALSE);
-    }
-    SendMessageW(g.list, WM_SETREDRAW, TRUE, 0);
-    LayoutColumns();
-    InvalidateRect(g.list, NULL, TRUE);
-    g.checkedFolder[0] = 0;
-    UpdateButtons();
+    int row = Profiles_Find(&g_manager.profiles, folder);
+    if (row < 0 && g_manager.profiles.count > 0) row = 0;
+    if (row >= 0) ListView_SetItemState(g_manager.list, row, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    return row;
 }
 
-static BOOL SameProfiles(const ProfileList *a, const ProfileList *b)
+/* The program moves the selection: the row comes into sight. */
+static void SelectProfileRow(const WCHAR *folder)
+{
+    int row = SetSelectedRow(folder);
+    if (row >= 0) ListView_EnsureVisible(g_manager.list, row, FALSE);
+}
+
+/* A refill keeps the view where it was (the viewport follows a row brought
+ * into sight even during a refill): only a selection that had to move, its
+ * profile gone, comes into sight once drawing is back on. */
+static void FillList(const WCHAR *select)
+{
+    LVITEMW item;
+    int rowImages[MAX_PROFILES], i, row;
+    BOOL selectionMoved = select && select[0] && Profiles_Find(&g_manager.profiles, select) < 0;
+    SendMessageW(g_manager.list, WM_SETREDRAW, FALSE, 0);
+    ListView_DeleteAllItems(g_manager.list);
+    RebuildImages(rowImages);
+    for (i = 0; i < g_manager.profiles.count; i++) {
+        ZeroMemory(&item, sizeof item);
+        item.mask = LVIF_TEXT | LVIF_IMAGE;
+        item.iItem = i;
+        item.iImage = rowImages[i];
+        item.pszText = g_manager.profiles.items[i].name;
+        ListView_InsertItem(g_manager.list, &item);
+        UpdateRow(i);
+    }
+    row = SetSelectedRow(select);
+    SendMessageW(g_manager.list, WM_SETREDRAW, TRUE, 0);
+    if (selectionMoved && row >= 0) ListView_EnsureVisible(g_manager.list, row, FALSE);
+    LayoutColumns();
+    InvalidateRect(g_manager.list, NULL, TRUE);
+    g_manager.shortcutStateFolder[0] = 0;
+    UpdateButtons();
+    UpdateNote();
+}
+
+/* Whether the list shows the same rows: folders, names and colors. */
+static BOOL SameProfileRows(const ProfileList *a, const ProfileList *b)
 {
     int i;
     if (a->count != b->count) return FALSE;
     for (i = 0; i < a->count; i++) {
-        if (!Same(a->items[i].folder, b->items[i].folder) || wcscmp(a->items[i].name, b->items[i].name) != 0 ||
+        if (!Core_EqualsI(a->items[i].folder, b->items[i].folder) || wcscmp(a->items[i].name, b->items[i].name) != 0 ||
             a->items[i].color != b->items[i].color)
             return FALSE;
     }
@@ -199,11 +270,11 @@ static BOOL SameProfiles(const ProfileList *a, const ProfileList *b)
 
 /* --------------------------------------------------------------- status */
 
-/* "2.2553.13.0" -> "2.2553.13", as Claude shows it. */
+/* "2.16120.0.0" -> "2.16120.0", as Claude shows it. */
 static void ShortVersion(WCHAR *out, size_t cch)
 {
     size_t n;
-    StringCchCopyW(out, cch, g.pkg.version);
+    StringCchCopyW(out, cch, g_manager.pkg.version);
     n = wcslen(out);
     if (n > 2 && out[n - 2] == L'.' && out[n - 1] == L'0') out[n - 2] = 0;
 }
@@ -211,59 +282,44 @@ static void ShortVersion(WCHAR *out, size_t cch)
 static void UpdateStatus(void)
 {
     WCHAR text[256], version[32];
-    FixAction fix = FIX_NONE;
+    StatusAction action = STATUS_ACTION_NONE;
 
     ShortVersion(version, ARRAYSIZE(version));
 
-    if (!g.pkg.found) {
-        StringCchCopyW(text, ARRAYSIZE(text), L"Claude Desktop is not installed.");
-        fix = FIX_GET_CLAUDE;
+    if (!g_manager.pkg.found) {
+        StringCchCopyW(text, ARRAYSIZE(text), TR(L"Claude Desktop is not installed."));
+        action = STATUS_ACTION_GET_CLAUDE;
     } else if (Handler_UserChoice() != USERCHOICE_OURS) {
-        StringCchPrintfW(text, ARRAYSIZE(text), L"Claude Desktop %s \x00B7 claude:// links are not set up yet", version);
-        fix = FIX_LINKS;
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Claude Desktop %s \x00B7 claude:// links are not set up yet"), version);
+        action = STATUS_ACTION_SET_UP_LINKS;
     } else {
-        StringCchPrintfW(text, ARRAYSIZE(text), L"Claude Desktop %s \x00B7 sign-in links open in the right window", version);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Claude Desktop %s \x00B7 claude:// links are routed correctly"), version);
     }
     SetTextIfChanged(IDC_STATUS, text);
-    if (fix != g.fix) {
-        HWND button = GetDlgItem(g.dlg, IDC_FIX);
-        if (fix == FIX_NONE && GetFocus() == button) {
-            /* Never hide the focused control: focus goes back to the list. */
-            SendMessageW(g.dlg, WM_NEXTDLGCTL, (WPARAM)g.list, TRUE);
-            SendMessageW(g.dlg, DM_SETDEFID, IDC_OPEN, 0);
-        }
-        g.fix = fix;
-        SetDlgItemTextW(g.dlg, IDC_FIX, fix == FIX_GET_CLAUDE ? L"Get Claude" : L"Set up links");
-        ShowWindow(GetDlgItem(g.dlg, IDC_FIX), fix != FIX_NONE ? SW_SHOW : SW_HIDE);
-        /* The status line, on the right, ends before that button while it shows. */
-        {
-            RECT r = { 92, 10, fix != FIX_NONE ? 328 : 410, 20 };
-            MapDialogRect(g.dlg, &r);
-            SetWindowPos(GetDlgItem(g.dlg, IDC_STATUS), NULL, r.left, r.top, r.right - r.left, r.bottom - r.top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
+    SetTextIfChanged(IDC_STATUS_ACTION, TR(Theme_MainCaption(IDC_STATUS_ACTION, action != STATUS_ACTION_GET_CLAUDE)));
+    /* Never hide the focused control. */
+    if (action == STATUS_ACTION_NONE && GetFocus() == GetDlgItem(g_manager.dlg, IDC_STATUS_ACTION))
+        FocusView(g_manager.dlg, SessionsView_Shown());
+    g_manager.statusAction = action;
+    ShowOptionalButton(IDC_STATUS_ACTION, action != STATUS_ACTION_NONE);
 }
 
 /* Text of a static that names a profile: a long name is cut (with an
- * ellipsis) until the whole text fits `box` (client coordinates). `fmt` has
- * one %s. Returns the height the text takes. */
-static int FitNameIn(HWND control, const RECT *box, const WCHAR *fmt, const WCHAR *name, WCHAR *text, size_t cch)
+ * ellipsis) until the whole text fits `box` (client coordinates). `format`
+ * has one %s. Returns the height the text takes. */
+static int FitNameIn(HWND control, const RECT *box, const WCHAR *format, const WCHAR *name, WCHAR *text, size_t cch)
 {
-    WCHAR shown[LABEL_CCH + 2];
     RECT need;
     HDC dc;
     HFONT old;
-    size_t len = wcslen(name), keep;
+    size_t keep;
 
     dc = GetDC(control);
     old = (HFONT)SelectObject(dc, (HFONT)SendMessageW(control, WM_GETFONT, 0, 0));
-    for (keep = len; ; keep--) {
-        StringCchCopyNW(shown, ARRAYSIZE(shown), name, keep);
-        if (keep < len) StringCchCatW(shown, ARRAYSIZE(shown), L"\x2026");
-        StringCchPrintfW(text, cch, fmt, shown);
+    for (keep = wcslen(name); ; keep = Localize_ShorterCut(name, keep)) {
+        Localize_FormatCutName(format, name, keep, text, cch);
         need = *box;
-        DrawTextW(dc, text, -1, &need, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS);
+        DrawTextW(dc, text, -1, &need, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS | Localize_ReadingFlags());
         if (keep <= 1 || (need.bottom - need.top <= box->bottom - box->top && need.right <= box->right)) break;
     }
     SelectObject(dc, old);
@@ -271,151 +327,122 @@ static int FitNameIn(HWND control, const RECT *box, const WCHAR *fmt, const WCHA
     return need.bottom - need.top;
 }
 
-static void FitName(HWND control, const WCHAR *fmt, const WCHAR *name, WCHAR *text, size_t cch)
+static void FitName(HWND control, const WCHAR *format, const WCHAR *name, WCHAR *text, size_t cch)
 {
     RECT box;
     GetClientRect(control, &box);
-    FitNameIn(control, &box, fmt, name, text, cch);
+    FitNameIn(control, &box, format, name, text, cch);
 }
 
-/* The note beside the buttons names the stock profile. It ends where the
- * profiles list ends, "Set as default" just above it. */
+/* The note under Set as default names the profile the regular Claude icon
+ * opens; it depends on that name, the language and the scale only. */
 static void UpdateNote(void)
 {
-    WCHAR text[256];
-    HWND note = GetDlgItem(g.dlg, IDC_NOTE), button = GetDlgItem(g.dlg, IDC_DEFAULT);
-    RECT area = { 334, 0, 412, 0 }, list, above, box, gap = { 0, 0, 0, 7 }, reserve = { 0, 0, 0, 10 + 15 + 7 };
-    int height;
-    MapDialogRect(g.dlg, &area);
-    MapDialogRect(g.dlg, &gap);
-    MapDialogRect(g.dlg, &reserve);
-    GetWindowRect(g.listArea, &list);
-    MapWindowPoints(NULL, g.dlg, (POINT *)&list, 2);
-    /* At most up to "Set as default" 10 units under Delete. */
-    GetWindowRect(GetDlgItem(g.dlg, IDC_DELETE), &above);
-    MapWindowPoints(NULL, g.dlg, (POINT *)&above, 2);
-    area.top = above.bottom + reserve.bottom;
-    area.bottom = list.bottom;
-    box.left = box.top = 0;
-    box.right = area.right - area.left;
-    box.bottom = area.bottom - area.top;
-    height = FitNameIn(note, &box, L"The default profile opens claude:// links while Claude is closed.\n\nThe regular Claude icon opens \x201C%s\x201D.",
-                       StockName(), text, ARRAYSIZE(text));
-    height = min(height, box.bottom);
-    SetWindowPos(note, NULL, area.left, area.bottom - height, box.right, height, SWP_NOZORDER | SWP_NOACTIVATE);
-    GetWindowRect(button, &box);
-    MapWindowPoints(NULL, g.dlg, (POINT *)&box, 2);
-    SetWindowPos(button, NULL, box.left, area.bottom - height - gap.bottom - (box.bottom - box.top), 0, 0,
-                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
-    SetTextIfChanged(IDC_NOTE, text);
+    Theme_LayoutSidebarNote(GetDlgItem(g_manager.dlg, IDC_NOTE),
+                            TR(Theme_MainNote()),
+                            StockProfileName());
 }
 
-static void SetKeepText(HWND d, const ProfileList *list)
+static void SetKeepText(HWND dialog, const ProfileList *list)
 {
-    WCHAR text[256];
+    WCHAR text[1024];
     int i = Profiles_Find(list, STOCK_FOLDER);
-    FitName(GetDlgItem(d, IDC_U_KEEP),
-            L"Claude Desktop and its \x201C%s\x201D profile (the one the regular Claude icon opens) are not touched.",
+    FitName(GetDlgItem(dialog, IDC_U_KEEP),
+            TR(L"Claude Desktop and its \x201C%s\x201D profile (the one the regular Claude icon opens) are not touched."),
             i >= 0 ? list->items[i].name : STOCK_DEFAULT_NAME, text, ARRAYSIZE(text));
-    SetDlgItemTextW(d, IDC_U_KEEP, text);
+    SetDlgItemTextW(dialog, IDC_U_KEEP, text);
 }
 
 static void UpdateButtons(void)
 {
-    const Profile *p = Selected();
+    const Profile *p = SelectedProfile();
     WCHAR text[256];
-    BOOL isDefault = p && Same(p->folder, g.profiles.defaultFolder);
+    BOOL isDefault = p && Core_EqualsI(p->folder, g_manager.profiles.defaultFolder);
 
-    if (p && !Same(p->folder, g.checkedFolder)) {
-        StringCchCopyW(g.checkedFolder, ARRAYSIZE(g.checkedFolder), p->folder);
-        g.onDesktop = Shortcut_FindOnDesktop(p, NULL, 0);
-        g.pinned = TaskbarPin_IsPinned(p);
-        g.inStartMenu = Shortcut_IsInStartMenu(p);
+    if (p && !Core_EqualsI(p->folder, g_manager.shortcutStateFolder)) {
+        StringCchCopyW(g_manager.shortcutStateFolder, ARRAYSIZE(g_manager.shortcutStateFolder), p->folder);
+        g_manager.onDesktop = Shortcut_IsOnDesktop(p);
+        g_manager.pinned = TaskbarPin_IsPinned(p);
+        g_manager.inStartMenu = Shortcut_IsInStartMenu(p);
     }
-    Enable(IDC_OPEN, p && g.pkg.found);
-    Enable(IDC_NEW, g.profiles.count < MAX_PROFILES);
-    Enable(IDC_EDIT, p != NULL);
-    Enable(IDC_DELETE, p && !p->isStock);
-    Enable(IDC_DEFAULT, p && !isDefault);
-    Enable(IDC_SC_DESKTOP, p && !g.onDesktop);
-    Enable(IDC_SC_SAVEAS, p != NULL);
-    Enable(IDC_SC_PIN, p && !g.pinned);
-    Enable(IDC_SC_START, p != NULL);
+    EnableControl(IDC_OPEN, p && g_manager.pkg.found);
+    EnableControl(IDC_NEW, g_manager.profiles.count < MAX_PROFILES);
+    EnableControl(IDC_EDIT, p != NULL);
+    EnableControl(IDC_DELETE, p && !p->isStock);
+    EnableControl(IDC_DEFAULT, p && !isDefault);
+    EnableControl(IDC_SC_DESKTOP, p && !g_manager.onDesktop);
+    EnableControl(IDC_SC_SAVEAS, p != NULL);
+    EnableControl(IDC_SC_PIN, p && !g_manager.pinned);
+    EnableControl(IDC_SC_START, p != NULL);
     /* A button off because it is done says so. */
-    SetTextIfChanged(IDC_SC_DESKTOP, p && g.onDesktop ? L"Shortcut on desktop" : L"Create shortcut on desktop");
-    SetTextIfChanged(IDC_SC_PIN, p && g.pinned ? L"Pinned" : L"Pin to taskbar");
-    SetTextIfChanged(IDC_SC_START, p && g.inStartMenu ? L"Remove from Start menu" : L"Add to Start menu");
+    SetTextIfChanged(IDC_SC_DESKTOP, TR(Theme_MainCaption(IDC_SC_DESKTOP, p && g_manager.onDesktop)));
+    SetTextIfChanged(IDC_SC_PIN, TR(Theme_MainCaption(IDC_SC_PIN, p && g_manager.pinned)));
+    SetTextIfChanged(IDC_SC_START, TR(Theme_MainCaption(IDC_SC_START, p && g_manager.inStartMenu)));
 
     if (p)
-        StringCchPrintfW(text, ARRAYSIZE(text), L"Shortcuts for \x201C%s\x201D", p->name);
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(L"Shortcuts for \x201C%s\x201D"), p->name);
     else
-        StringCchCopyW(text, ARRAYSIZE(text), L"Shortcuts");
+        StringCchCopyW(text, ARRAYSIZE(text), TR(L"Shortcuts"));
     SetTextIfChanged(IDC_SC_GROUP, text);
-    if (p && p->color != g.groupColor) {
-        g.groupColor = p->color;
-        InvalidateRect(GetDlgItem(g.dlg, IDC_SC_GROUP), NULL, TRUE);
+    if (p && p->color != g_manager.groupColor) {
+        g_manager.groupColor = p->color;
+        InvalidateRect(GetDlgItem(g_manager.dlg, IDC_SC_GROUP), NULL, TRUE);
     }
-    UpdateNote();
 }
 
-/* Shortcuts for "(badge) Name": owner-drawn to show the profile's
- * badge before its name. The window text stays the plain sentence (screen
- * readers read it). */
-static void DrawGroupLabel(const DRAWITEMSTRUCT *di)
+/* The badge of the "Shortcuts for" label, made again only for another color
+ * or size. */
+static HICON GroupBadge(int color, int size)
 {
-    static const WCHAR lead[] = L"Shortcuts for \x201C", close[] = L"\x201D";
-    const Profile *p = Selected();
-    HDC dc = di->hDC;
-    RECT rc = di->rcItem;
+    if (g_manager.groupBadge && (g_manager.groupBadgeColor != color || g_manager.groupBadgeSize != size)) {
+        DestroyIcon(g_manager.groupBadge);
+        g_manager.groupBadge = NULL;
+    }
+    if (!g_manager.groupBadge) {
+        g_manager.groupBadge = Icons_CreateBadge(color, size);
+        g_manager.groupBadgeColor = color;
+        g_manager.groupBadgeSize = size;
+    }
+    return g_manager.groupBadge;
+}
+
+/* Shortcuts for "(badge) Name": owner-drawn to show the profile's badge
+ * before its name, on the left in every language as the list's icons are.
+ * The window text stays the plain sentence (screen readers read it). */
+static void DrawGroupLabel(const DRAWITEMSTRUCT *item)
+{
+    const Profile *p = SelectedProfile();
+    HDC dc = item->hDC;
+    RECT rc = item->rcItem;
     HFONT old;
     HICON badge;
-    TEXTMETRICW tm;
-    SIZE ext;
-    WCHAR shown[LABEL_CCH + 2];
-    size_t len, keep;
-    int x, top, cap, dot, gap, closeWidth;
+    TEXTMETRICW metrics;
+    WCHAR text[512];
+    int top, dot, gap;
 
     SetTextColor(dc, Theme_Color(THEME_TEXT));
     FillRect(dc, &rc, Theme_Brush(THEME_FACE));
     SetBkMode(dc, TRANSPARENT);
-    old = (HFONT)SelectObject(dc, (HFONT)SendMessageW(di->hwndItem, WM_GETFONT, 0, 0));
-    GetTextMetricsW(dc, &tm);
-    top = rc.top + (rc.bottom - rc.top - tm.tmHeight) / 2;
+    old = (HFONT)SelectObject(dc, (HFONT)SendMessageW(item->hwndItem, WM_GETFONT, 0, 0));
+    GetTextMetricsW(dc, &metrics);
+    top = rc.top + (rc.bottom - rc.top - metrics.tmHeight) / 2;
     if (!p) {
-        TextOutW(dc, rc.left, top, L"Shortcuts", 9);
+        DrawTextW(dc, TR(L"Shortcuts"), -1, &rc,
+                  DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | Localize_ReadingFlags());
         SelectObject(dc, old);
         return;
     }
 
-    x = rc.left;
-    GetTextExtentPoint32W(dc, lead, (int)wcslen(lead), &ext);
-    TextOutW(dc, x, top, lead, (int)wcslen(lead));
-    x += ext.cx;
-
-    /* The badge, as tall as the capitals and centred on them. */
-    cap = tm.tmAscent - tm.tmInternalLeading;
-    dot = cap + 2;
-    GetTextExtentPoint32W(dc, L" ", 1, &ext);
-    gap = ext.cx;
-    badge = Icons_CreateBadge(p->color, dot);
+    dot = metrics.tmAscent - metrics.tmInternalLeading + GROUP_BADGE_OVERHANG;
+    gap = MulDiv(GROUP_BADGE_GAP_DIPS, (int)GetDpiForWindow(item->hwndItem), 96);
+    badge = GroupBadge(p->color, dot);
     if (badge) {
-        DrawIconEx(dc, x + 1, top + tm.tmAscent - (cap + dot + 1) / 2, badge, dot, dot, 0, NULL, DI_NORMAL);
-        DestroyIcon(badge);
-        x += 1 + dot + gap;
+        DrawIconEx(dc, rc.left, top, badge, dot, dot, 0, NULL, DI_NORMAL);
+        rc.left += dot + gap;
     }
 
-    /* A long name is cut, with an ellipsis, so the closing quote still shows. */
-    GetTextExtentPoint32W(dc, close, 1, &ext);
-    closeWidth = ext.cx;
-    len = wcslen(p->name);
-    for (keep = len; ; keep--) {
-        StringCchCopyNW(shown, ARRAYSIZE(shown), p->name, keep);
-        if (keep < len) StringCchCatW(shown, ARRAYSIZE(shown), L"\x2026");
-        GetTextExtentPoint32W(dc, shown, (int)wcslen(shown), &ext);
-        if (keep <= 1 || x + ext.cx + closeWidth <= rc.right) break;
-    }
-    TextOutW(dc, x, top, shown, (int)wcslen(shown));
-    TextOutW(dc, x + ext.cx, top, close, 1);
+    FitNameIn(item->hwndItem, &rc, TR(L"Shortcuts for \x201C%s\x201D"), p->name, text, ARRAYSIZE(text));
+    DrawTextW(dc, text, -1, &rc, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | Localize_ReadingFlags());
     SelectObject(dc, old);
 }
 
@@ -423,52 +450,106 @@ static void DrawGroupLabel(const DRAWITEMSTRUCT *di)
  * name and description. */
 static void ApplyBadge(const Profile *before, const Profile *after, const WCHAR *icon)
 {
-    BOOL links = Shortcut_Refresh(before, after, icon);
+    BOOL links;
+    FinishShellWork();
+    links = Shortcut_Refresh(before, after, icon);
     TaskbarPin_Refresh(before, after, icon);
     Taskbar_Refresh(after, links);   /* its open windows, if it runs */
     Icons_DeleteStale(after, icon);
 }
 
-/* Shortcuts, pins and open windows showing an icon made while Claude was
- * missing, or by an older drawing of the badge, get the current icon. */
+/* Shortcuts, pins and open windows with different artwork or badge drawing
+ * parameters get the current icon. */
 static void HealIcons(const ProfileList *list)
 {
     WCHAR icon[MAX_PATH];
     int i;
     for (i = 0; i < list->count; i++) {
         const Profile *p = &list->items[i];
-        if (Icons_IsStale(&g.pkg, p) && Icons_Ensure(&g.pkg, p, icon, ARRAYSIZE(icon))) ApplyBadge(p, p, icon);
+        if (Icons_IsStale(&g_manager.pkg, p) && Icons_Ensure(&g_manager.pkg, p, icon, ARRAYSIZE(icon))) ApplyBadge(p, p, icon);
     }
+}
+
+/* The rows' texts and the buttons again, for the rows the list shows. */
+static void UpdateRowsAndButtons(void)
+{
+    int i;
+    for (i = 0; i < g_manager.profiles.count; i++) UpdateRow(i);
+    UpdateButtons();
 }
 
 static void Refresh(BOOL rescanPackage)
 {
     ProfileList fresh;
-    WCHAR sel[FOLDER_CCH] = L"";
-    const Profile *p = Selected();
-    BOOL hadClaude = g.pkg.found;
-    int i;
+    WCHAR selected[FOLDER_CCH] = L"";
+    const Profile *p = SelectedProfile();
+    BOOL hadClaude = g_manager.pkg.found, sameRows;
 
-    if (p) StringCchCopyW(sel, ARRAYSIZE(sel), p->folder);
-    if (rescanPackage) Claude_FindPackage(&g.pkg);
-    Profiles_Load(&fresh);
+    if (p) StringCchCopyW(selected, ARRAYSIZE(selected), p->folder);
+    if (rescanPackage) Claude_FindPackage(&g_manager.pkg);
+    Profiles_Load(&fresh, &g_manager.pkg);
     if (rescanPackage) HealIcons(&fresh);
-    if (!SameProfiles(&fresh, &g.profiles) || hadClaude != g.pkg.found) {
-        g.profiles = fresh;
-        FillList(sel);
-    } else {
-        g.profiles = fresh;
-        for (i = 0; i < g.profiles.count; i++) UpdateRow(i);
-        UpdateButtons();
-    }
+    sameRows = SameProfileRows(&fresh, &g_manager.profiles) && hadClaude == g_manager.pkg.found;
+    g_manager.profiles = fresh;
+    if (sameRows) UpdateRowsAndButtons();
+    else FillList(selected);
+    SessionsView_SetProfiles(&g_manager.profiles);
+    if (!StateChangesBlocked()) SessionsView_Ready(TRUE);
     UpdateStatus();
+}
+
+/* What changed shows at once, before work that keeps the window from
+ * painting meanwhile: shortcuts and pins take about a second to write. */
+static void ShowChanges(void)
+{
+    RedrawWindow(g_manager.dlg, NULL, NULL, RDW_UPDATENOW | RDW_ALLCHILDREN);
+}
+
+/* What Windows shows of the program, in a new language, written on a thread
+ * of its own from a copy of the profiles. */
+typedef struct LanguageWork {
+    ClaudePackage pkg;
+    ProfileList   profiles;
+} LanguageWork;
+
+static DWORD WINAPI ApplyLanguageWork(void *param)
+{
+    LanguageWork *work = (LanguageWork *)param;
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    Install_ApplyLanguage(&work->pkg, &work->profiles);
+    if (SUCCEEDED(hr)) CoUninitialize();
+    HeapFree(GetProcessHeap(), 0, work);
+    return 0;
+}
+
+static void StartLanguageWork(void)
+{
+    LanguageWork *work = (LanguageWork *)HeapAlloc(GetProcessHeap(), 0, sizeof *work);
+    if (work) {
+        work->pkg = g_manager.pkg;
+        work->profiles = g_manager.profiles;
+        g_manager.shellWork = CreateThread(NULL, 0, ApplyLanguageWork, work, 0, NULL);
+        if (g_manager.shellWork) return;
+        HeapFree(GetProcessHeap(), 0, work);
+    }
+    Install_ApplyLanguage(&g_manager.pkg, &g_manager.profiles);   /* no thread: at once, then */
+}
+
+/* Shortcuts and pins have one writer at a time: what writes them waits for
+ * the language's work first. */
+static void FinishShellWork(void)
+{
+    if (!g_manager.shellWork) return;
+    if (WaitForSingleObject(g_manager.shellWork, SHELL_WORK_WAIT_MS) != WAIT_OBJECT_0)
+        Util_Log(L"the shortcuts and pins of the new language were still being written");
+    CloseHandle(g_manager.shellWork);
+    g_manager.shellWork = NULL;
 }
 
 /* --------------------------------------------------------- profile dialog */
 
 typedef struct ProfileDialog {
-    BOOL           isNew;
-    const Profile *existing;
+    const Profile *existing;   /* NULL: a new profile */
     const Profile *copyFrom;   /* new profile: whose settings it can start with */
     WCHAR          name[LABEL_CCH];
     int            color;
@@ -476,144 +557,155 @@ typedef struct ProfileDialog {
     BOOL           startup;
     BOOL           copy;
     HICON          preview;
+    WCHAR          previewInitial;   /* what `preview` shows, so typing redraws it only when this changes */
+    int            previewColor;
+    int            previewSize;
 } ProfileDialog;
 
-/* The edit dialog has no rows for opening now and copying settings: the
- * buttons move up and the dialog shrinks by those rows. */
-static void DropProfileRows(HWND d)
+/* The "Copy settings from" check box: a long profile name is cut (with an
+ * ellipsis) until the caption and the box's glyph fit the control. */
+static void SetCopyLabel(HWND checkBox, const WCHAR *name)
 {
-    const int ids[] = { IDOK, IDCANCEL };
-    RECT rows = { 0, 0, 0, 26 }, r;
-    size_t i;
-    MapDialogRect(d, &rows);
-    for (i = 0; i < ARRAYSIZE(ids); i++) {
-        HWND c = GetDlgItem(d, ids[i]);
-        GetWindowRect(c, &r);
-        MapWindowPoints(NULL, d, (POINT *)&r, 2);
-        SetWindowPos(c, NULL, r.left, r.top - rows.bottom, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    WCHAR text[512];
+    RECT box;
+    SIZE need;
+    size_t keep;
+    GetClientRect(checkBox, &box);
+    for (keep = wcslen(name); ; keep = Localize_ShorterCut(name, keep)) {
+        Localize_FormatCutCaption(TR(L"Copy &settings from \x201C%s\x201D"), name, keep, text, ARRAYSIZE(text));
+        SetWindowTextW(checkBox, text);
+        if (keep <= 1 || !Theme_CheckBoxSize(checkBox, &need) || need.cx <= box.right - box.left) break;
     }
-    GetWindowRect(d, &r);
-    SetWindowPos(d, NULL, 0, 0, r.right - r.left, r.bottom - r.top - rows.bottom, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-static BOOL ValidateProfileDialog(HWND d, ProfileDialog *s, BOOL showError)
+static BOOL ValidateProfileDialog(HWND dialog, ProfileDialog *state, BOOL showError)
 {
     WCHAR raw[128], clean[LABEL_CCH], folder[FOLDER_CCH], info[MAX_PATH + 96], appData[MAX_PATH], dir[MAX_PATH];
-    const WCHAR *err = NULL;
-    BOOL ok;
+    WCHAR placeholder[FOLDER_CCH];
+    const WCHAR *error = NULL;   /* English, translated where it shows */
+    BOOL ok, errorShown;
 
-    GetDlgItemTextW(d, IDC_P_NAME, raw, ARRAYSIZE(raw));
-    if (s->isNew) {
-        ok = Core_ValidateNewName(raw, clean, ARRAYSIZE(clean), folder, ARRAYSIZE(folder), &err);
+    GetDlgItemTextW(dialog, IDC_P_NAME, raw, ARRAYSIZE(raw));
+    if (!state->existing) {
+        ok = Core_ValidateNewName(raw, clean, ARRAYSIZE(clean), folder, ARRAYSIZE(folder), &error);
         if (ok && Util_AppData(appData, ARRAYSIZE(appData)) &&
             SUCCEEDED(StringCchPrintfW(dir, ARRAYSIZE(dir), L"%s\\%s", appData, folder)) &&
             GetFileAttributesW(dir) != INVALID_FILE_ATTRIBUTES) {
             ok = FALSE;
-            err = L"A profile folder with this name already exists.";
+            error = L"A profile folder with this name already exists.";
         }
-        StringCchPrintfW(info, ARRAYSIZE(info), L"Its data will be kept in %%APPDATA%%\\%s.", ok ? folder : PROFILE_PREFIX L"<name>");
+        StringCchPrintfW(placeholder, ARRAYSIZE(placeholder), PROFILE_PREFIX L"%s", TR(L"<name>"));
+        StringCchPrintfW(info, ARRAYSIZE(info), TR(L"Its data will be kept in %%APPDATA%%\\%s."), ok ? folder : placeholder);
     } else {
-        ok = Core_ValidateLabel(raw, clean, ARRAYSIZE(clean), &err);
-        StringCchPrintfW(info, ARRAYSIZE(info), L"Data folder: %%APPDATA%%\\%s%s", s->existing->folder,
-                         s->existing->isStock ? L"\nThe regular Claude icon opens this profile." : L"");
+        ok = Core_ValidateLabel(raw, clean, ARRAYSIZE(clean), &error);
+        StringCchPrintfW(info, ARRAYSIZE(info), TR(L"Data folder: %%APPDATA%%\\%s%s"), state->existing->folder,
+                         state->existing->isStock ? TR(L"\nThe regular Claude icon opens this profile.") : L"");
     }
     /* The error takes the place of the folder line while there is one. */
-    SetDlgItemTextW(d, IDC_P_FOLDER, info);
-    SetDlgItemTextW(d, IDC_P_ERROR, (!ok && showError && err) ? err : L"");
-    ShowWindow(GetDlgItem(d, IDC_P_FOLDER), (!ok && showError && err) ? SW_HIDE : SW_SHOW);
-    ShowWindow(GetDlgItem(d, IDC_P_ERROR), (!ok && showError && err) ? SW_SHOW : SW_HIDE);
-    EnableWindow(GetDlgItem(d, IDOK), ok);
-    if (ok) StringCchCopyW(s->name, ARRAYSIZE(s->name), clean);
+    errorShown = !ok && showError && error;
+    SetDlgItemTextW(dialog, IDC_P_FOLDER, info);
+    SetDlgItemTextW(dialog, IDC_P_ERROR, errorShown ? TR(error) : L"");
+    ShowWindow(GetDlgItem(dialog, IDC_P_FOLDER), errorShown ? SW_HIDE : SW_SHOW);
+    ShowWindow(GetDlgItem(dialog, IDC_P_ERROR), errorShown ? SW_SHOW : SW_HIDE);
+    EnableWindow(GetDlgItem(dialog, IDOK), ok);
+    if (ok) StringCchCopyW(state->name, ARRAYSIZE(state->name), clean);
     return ok;
 }
 
-static void UpdatePreview(HWND d, ProfileDialog *s)
+static void UpdatePreview(HWND dialog, ProfileDialog *state)
 {
-    Profile tmp;
+    Profile sample;
     HICON icon;
-    int sel = (int)SendDlgItemMessageW(d, IDC_P_COLOR, CB_GETCURSEL, 0, 0);
-    ZeroMemory(&tmp, sizeof tmp);
-    GetDlgItemTextW(d, IDC_P_NAME, tmp.name, ARRAYSIZE(tmp.name));
-    tmp.color = sel >= 0 && sel < PALETTE_SIZE ? sel : 0;
-    icon = Icons_Create(&g.pkg, &tmp, MulDiv(32, (int)GetDpiForWindow(d), 96));
-    SendDlgItemMessageW(d, IDC_P_PREVIEW, STM_SETICON, (WPARAM)icon, 0);
-    if (s->preview) DestroyIcon(s->preview);
-    s->preview = icon;
+    int color = (int)SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_GETCURSEL, 0, 0), size;
+    WCHAR initial;
+    ZeroMemory(&sample, sizeof sample);
+    GetDlgItemTextW(dialog, IDC_P_NAME, sample.name, ARRAYSIZE(sample.name));
+    sample.color = color >= 0 && color < PALETTE_SIZE ? color : 0;
+    size = MulDiv(PREVIEW_ICON_DIPS, (int)GetDpiForWindow(dialog), 96);
+    initial = Icons_ProfileInitial(sample.name);
+    if (state->preview && state->previewInitial == initial && state->previewColor == sample.color && state->previewSize == size)
+        return;
+    icon = Icons_Create(&g_manager.pkg, &sample, size);
+    SendDlgItemMessageW(dialog, IDC_P_PREVIEW, STM_SETICON, (WPARAM)icon, 0);
+    if (state->preview) DestroyIcon(state->preview);
+    state->preview = icon;
+    state->previewInitial = initial;
+    state->previewColor = sample.color;
+    state->previewSize = size;
 }
 
-static INT_PTR CALLBACK ProfileProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
+static INT_PTR CALLBACK ProfileProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
-    ProfileDialog *s = (ProfileDialog *)GetWindowLongPtrW(d, DWLP_USER);
+    ProfileDialog *state = (ProfileDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
     int i;
 
-    switch (msg) {
+    switch (message) {
     case WM_INITDIALOG:
-        s = (ProfileDialog *)lp;
-        SetWindowLongPtrW(d, DWLP_USER, lp);
-        SetWindowTextW(d, s->isNew ? L"New profile" : L"Edit profile");
-        SendDlgItemMessageW(d, IDC_P_NAME, EM_LIMITTEXT, MAX_LABEL, 0);
-        for (i = 0; i < PALETTE_SIZE; i++) SendDlgItemMessageW(d, IDC_P_COLOR, CB_ADDSTRING, 0, (LPARAM)g_ColorNames[i]);
-        SendDlgItemMessageW(d, IDC_P_COLOR, CB_SETCURSEL, (WPARAM)(s->color >= 0 && s->color < PALETTE_SIZE ? s->color : 0), 0);
-        if (!s->isNew) SetDlgItemTextW(d, IDC_P_NAME, s->existing->name);
-        CheckDlgButton(d, IDC_P_OPEN, s->openNow ? BST_CHECKED : BST_UNCHECKED);
-        ShowWindow(GetDlgItem(d, IDC_P_OPEN), s->isNew && g.pkg.found ? SW_SHOW : SW_HIDE);
-        CheckDlgButton(d, IDC_P_STARTUP, s->startup ? BST_CHECKED : BST_UNCHECKED);
-        if (s->isNew && s->copyFrom) {
-            WCHAR label[LABEL_CCH + 64];
-            FitName(GetDlgItem(d, IDC_P_COPY), L"Copy &settings from \x201C%s\x201D", s->copyFrom->name, label, ARRAYSIZE(label));
-            SetDlgItemTextW(d, IDC_P_COPY, label);
-        } else {
-            ShowWindow(GetDlgItem(d, IDC_P_COPY), SW_HIDE);
-        }
-        if (!s->isNew) DropProfileRows(d);
-        ValidateProfileDialog(d, s, FALSE);
-        UpdatePreview(d, s);
-        SendDlgItemMessageW(d, IDC_P_NAME, EM_SETSEL, 0, -1);
-        SetFocus(GetDlgItem(d, IDC_P_NAME));
+        state = (ProfileDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetWindowTextW(dialog, state->existing ? TR(L"Edit profile") : TR(L"New profile"));
+        SendDlgItemMessageW(dialog, IDC_P_NAME, EM_LIMITTEXT, state->existing ? MAX_LABEL : MAX_NAME, 0);
+        for (i = 0; i < PALETTE_SIZE; i++) SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_ADDSTRING, 0, (LPARAM)TR(g_ColorNames[i]));
+        SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_SETCURSEL, (WPARAM)(state->color >= 0 && state->color < PALETTE_SIZE ? state->color : 0), 0);
+        if (state->existing) SetDlgItemTextW(dialog, IDC_P_NAME, state->existing->name);
+        CheckDlgButton(dialog, IDC_P_STARTUP, state->startup ? BST_CHECKED : BST_UNCHECKED);
+        CheckDlgButton(dialog, IDC_P_OPEN, state->openNow ? BST_CHECKED : BST_UNCHECKED);
+        /* A check box the dialog does not offer leaves no empty row (Theme_FitDialog closes it). */
+        ShowWindow(GetDlgItem(dialog, IDC_P_OPEN), !state->existing && g_manager.pkg.found ? SW_SHOW : SW_HIDE);
+        if (!state->existing && state->copyFrom) SetCopyLabel(GetDlgItem(dialog, IDC_P_COPY), state->copyFrom->name);
+        else ShowWindow(GetDlgItem(dialog, IDC_P_COPY), SW_HIDE);
+        ValidateProfileDialog(dialog, state, FALSE);
+        UpdatePreview(dialog, state);
+        SendDlgItemMessageW(dialog, IDC_P_NAME, EM_SETSEL, 0, -1);
+        SetFocus(GetDlgItem(dialog, IDC_P_NAME));
+        PostMessageW(dialog, WM_APP_FIT_NAMES, 0, 0);   /* Ui_Dialog fits the dialog after this message */
         return FALSE;
 
     case WM_COMMAND:
-        if (!s) break;
+        if (!state) break;
         switch (LOWORD(wp)) {
         case IDC_P_NAME:
             if (HIWORD(wp) == EN_CHANGE) {
-                ValidateProfileDialog(d, s, TRUE);
-                UpdatePreview(d, s);
+                ValidateProfileDialog(dialog, state, TRUE);
+                UpdatePreview(dialog, state);
             }
             return TRUE;
         case IDC_P_COLOR:
-            if (HIWORD(wp) == CBN_SELCHANGE) UpdatePreview(d, s);
+            if (HIWORD(wp) == CBN_SELCHANGE) UpdatePreview(dialog, state);
             return TRUE;
         case IDOK:
-            if (!ValidateProfileDialog(d, s, TRUE)) return TRUE;
-            i = (int)SendDlgItemMessageW(d, IDC_P_COLOR, CB_GETCURSEL, 0, 0);
-            s->color = i >= 0 && i < PALETTE_SIZE ? i : 0;
-            s->openNow = IsDlgButtonChecked(d, IDC_P_OPEN) == BST_CHECKED;
-            s->startup = IsDlgButtonChecked(d, IDC_P_STARTUP) == BST_CHECKED;
-            s->copy = s->isNew && s->copyFrom && IsDlgButtonChecked(d, IDC_P_COPY) == BST_CHECKED;
-            EndDialog(d, IDOK);
+            if (!ValidateProfileDialog(dialog, state, TRUE)) return TRUE;
+            i = (int)SendDlgItemMessageW(dialog, IDC_P_COLOR, CB_GETCURSEL, 0, 0);
+            state->color = i >= 0 && i < PALETTE_SIZE ? i : 0;
+            state->openNow = IsDlgButtonChecked(dialog, IDC_P_OPEN) == BST_CHECKED;
+            state->startup = IsDlgButtonChecked(dialog, IDC_P_STARTUP) == BST_CHECKED;
+            state->copy = !state->existing && state->copyFrom && IsDlgButtonChecked(dialog, IDC_P_COPY) == BST_CHECKED;
+            EndDialog(dialog, IDOK);
             return TRUE;
         case IDCANCEL:
-            EndDialog(d, IDCANCEL);
+            EndDialog(dialog, IDCANCEL);
             return TRUE;
         }
         break;
 
     case WM_CTLCOLORSTATIC:
-        return Theme_CtlColor(msg, wp, lp, IDC_P_FOLDER);
+        return Theme_CtlColor(message, wp, lp, IDC_P_FOLDER);
 
     case WM_DPICHANGED:
-        PostMessageW(d, WM_APP_DPI, 0, 0);
+        PostMessageW(dialog, WM_APP_FIT_NAMES, 0, 0);
         break;
 
-    case WM_APP_DPI:
-        if (s) UpdatePreview(d, s);
+    case WM_APP_FIT_NAMES:
+        if (state) {
+            if (!state->existing && state->copyFrom) SetCopyLabel(GetDlgItem(dialog, IDC_P_COPY), state->copyFrom->name);
+            UpdatePreview(dialog, state);
+        }
         return TRUE;
 
     case WM_DESTROY:
-        if (s && s->preview) {
-            DestroyIcon(s->preview);
-            s->preview = NULL;
+        if (state && state->preview) {
+            DestroyIcon(state->preview);
+            state->preview = NULL;
         }
         break;
     }
@@ -626,112 +718,101 @@ typedef struct UninstallDialog {
     const ProfileList *list;
     HWND rows;   /* the profiles to keep, as check boxes (in the view it scrolls in, which has its id) */
     BOOL removeData[MAX_PROFILES];
-    int  map[MAX_PROFILES];
-    int  count;
+    int  rowProfile[MAX_PROFILES];   /* each row's index in list */
+    int  rowCount;
 } UninstallDialog;
 
-/* As wide as the list: a longer row shows whole in its tooltip. */
-static void FitUninstallColumn(HWND list)
+static INT_PTR CALLBACK UninstallProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
 {
-    RECT rc;
-    GetClientRect(list, &rc);
-    ListView_SetColumnWidth(list, 0, rc.right - rc.left);
-}
-
-static INT_PTR CALLBACK UninstallProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
-{
-    UninstallDialog *u = (UninstallDialog *)GetWindowLongPtrW(d, DWLP_USER);
+    UninstallDialog *state = (UninstallDialog *)GetWindowLongPtrW(dialog, DWLP_USER);
     HWND list;
-    WCHAR text[MAX_PATH + 64];
-    LVCOLUMNW col;
-    LVITEMW it;
-    RECT rc;
+    WCHAR text[LABEL_CCH + MAX_PATH + 256];
+    LVCOLUMNW column;
+    LVITEMW item;
     int i;
 
-    switch (msg) {
+    switch (message) {
     case WM_INITDIALOG:
-        u = (UninstallDialog *)lp;
-        SetWindowLongPtrW(d, DWLP_USER, lp);
-        SetKeepText(d, u->list);
-        list = u->rows = GetDlgItem(d, IDC_U_LIST);
+        state = (UninstallDialog *)lp;
+        SetWindowLongPtrW(dialog, DWLP_USER, lp);
+        SetKeepText(dialog, state->list);
+        list = state->rows = GetDlgItem(dialog, IDC_U_LIST);
         ListView_SetExtendedListViewStyle(list, LVS_EX_CHECKBOXES | LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
-        GetClientRect(list, &rc);
-        ZeroMemory(&col, sizeof col);
-        col.mask = LVCF_WIDTH;
-        col.cx = rc.right - rc.left;
-        ListView_InsertColumn(list, 0, &col);   /* resized below, once the items are in */
-        u->count = 0;
-        for (i = 0; i < u->list->count; i++) {
+        ZeroMemory(&column, sizeof column);
+        ListView_InsertColumn(list, 0, &column);   /* the view it scrolls in gives it the list's width */
+        state->rowCount = 0;
+        for (i = 0; i < state->list->count; i++) {
+            const Profile *p = &state->list->items[i];
             WCHAR target[MAX_PATH];
-            if (u->list->items[i].isStock) continue;
-            if (Profiles_LinkTarget(&u->list->items[i], target, ARRAYSIZE(target)))
-                StringCchPrintfW(text, ARRAYSIZE(text), L"%s   (linked folder, kept: %s)", u->list->items[i].name, target);
+            if (p->isStock) continue;
+            if (Profiles_LinkTarget(p, target, ARRAYSIZE(target)))
+                StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s   (linked folder, kept: %s)"), p->name, target);
             else
-                StringCchPrintfW(text, ARRAYSIZE(text), L"%s   (%%APPDATA%%\\%s)", u->list->items[i].name, u->list->items[i].folder);
-            ZeroMemory(&it, sizeof it);
-            it.mask = LVIF_TEXT;
-            it.iItem = u->count;
-            it.pszText = text;
-            ListView_InsertItem(list, &it);
-            ListView_SetCheckState(list, u->count, TRUE);
-            u->map[u->count++] = i;
+                StringCchPrintfW(text, ARRAYSIZE(text), TR(L"%s   (%%APPDATA%%\\%s)"), p->name, p->folder);
+            ZeroMemory(&item, sizeof item);
+            item.mask = LVIF_TEXT;
+            item.iItem = state->rowCount;
+            item.pszText = text;
+            ListView_InsertItem(list, &item);
+            ListView_SetCheckState(list, state->rowCount, TRUE);
+            state->rowProfile[state->rowCount++] = i;
         }
-        FitUninstallColumn(list);
         list = Theme_SmoothView(list);   /* from here, the view that has its place */
-        if (u->count == 0) {
-            ShowWindow(GetDlgItem(d, IDC_U_LABEL), SW_HIDE);
+        if (state->rowCount == 0) {   /* nothing to keep: their rows close (Theme_FitDialog) */
+            ShowWindow(GetDlgItem(dialog, IDC_U_LABEL), SW_HIDE);
             ShowWindow(list, SW_HIDE);
-            ShowWindow(GetDlgItem(d, IDC_U_HINT), SW_HIDE);
+            ShowWindow(GetDlgItem(dialog, IDC_U_HINT), SW_HIDE);
         }
+        PostMessageW(dialog, WM_APP_FIT_NAMES, 0, 0);   /* Ui_Dialog fits the dialog after this message */
         return TRUE;
 
     case WM_DPICHANGED:
-        PostMessageW(d, WM_APP_DPI, 0, 0);
+        PostMessageW(dialog, WM_APP_FIT_NAMES, 0, 0);
         break;
 
-    case WM_APP_DPI:
-        if (u) {
-            FitUninstallColumn(u->rows);
-            SetKeepText(d, u->list);
-        }
+    case WM_APP_FIT_NAMES:
+        if (state) SetKeepText(dialog, state->list);
         return TRUE;
 
     case WM_CTLCOLORSTATIC:
-        return Theme_CtlColor(msg, wp, lp, IDC_U_HINT);
+        return Theme_CtlColor(message, wp, lp, IDC_U_HINT);
 
     case WM_COMMAND:
-        if (!u) break;
+        if (!state) break;
         if (LOWORD(wp) == IDOK) {
-            WCHAR ask[512] = L"";
+            WCHAR ask[2048] = L"";
             int drop = 0, links = 0;
-            list = u->rows;
-            ZeroMemory(u->removeData, sizeof u->removeData);
-            for (i = 0; i < u->count; i++) {
-                const Profile *p = &u->list->items[u->map[i]];
-                u->removeData[u->map[i]] = !ListView_GetCheckState(list, i);
-                if (!u->removeData[u->map[i]]) continue;
-                if (Profiles_IsLinked(p)) links++;
+            list = state->rows;
+            ZeroMemory(state->removeData, sizeof state->removeData);
+            for (i = 0; i < state->rowCount; i++) {
+                int index = state->rowProfile[i];
+                state->removeData[index] = !ListView_GetCheckState(list, i);
+                if (!state->removeData[index]) continue;
+                if (Profiles_IsLinked(&state->list->items[index])) links++;
                 else drop++;
             }
             if (drop > 0)
-                StringCchPrintfW(ask, ARRAYSIZE(ask),
-                                 L"The data of %d profile(s) will be moved to the Recycle Bin: their sign-in, local history, Claude Code and Cowork files.\n\n",
-                                 drop);
+                StringCchPrintfW(ask, ARRAYSIZE(ask), drop == 1
+                    ? TR(L"The data of %d profile will be moved to the Recycle Bin: its sign-in, local history, Claude Code and Cowork files.\n\n")
+                    : TR(L"The data of %d profiles will be moved to the Recycle Bin: their sign-in, local history, Claude Code and Cowork files.\n\n"),
+                    drop);
             if (links > 0) {
-                WCHAR more[256];
-                StringCchPrintfW(more, ARRAYSIZE(more),
-                                 L"%d linked profile(s) will be removed from " APP_NAME L"; the folders they link to stay on disk.\n\n", links);
+                WCHAR more[1024];
+                StringCchPrintfW(more, ARRAYSIZE(more), links == 1
+                    ? TR(L"%d linked profile will be removed from " APP_NAME L"; the folder it links to stays on disk.\n\n")
+                    : TR(L"%d linked profiles will be removed from " APP_NAME L"; the folders they link to stay on disk.\n\n"),
+                    links);
                 StringCchCatW(ask, ARRAYSIZE(ask), more);
             }
             if (drop + links > 0) {
-                StringCchCatW(ask, ARRAYSIZE(ask), L"Continue?");
-                if (Util_Message(d, MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2, L"%s", ask) != IDOK) return TRUE;
+                StringCchCatW(ask, ARRAYSIZE(ask), TR(L"Continue?"));
+                if (Ui_Message(dialog, MB_ICONWARNING | MB_OKCANCEL | MB_DEFBUTTON2, L"%s", ask) != IDOK) return TRUE;
             }
-            EndDialog(d, IDOK);
+            EndDialog(dialog, IDOK);
             return TRUE;
         }
         if (LOWORD(wp) == IDCANCEL) {
-            EndDialog(d, IDCANCEL);
+            EndDialog(dialog, IDCANCEL);
             return TRUE;
         }
         break;
@@ -746,13 +827,13 @@ static void OpenProfile(const Profile *profile)
     Profile p = *profile;
     BOOL identity = FALSE;
     HRESULT hr;
-    if (!g.pkg.found) {
-        Util_Message(g.dlg, MB_ICONWARNING, L"Claude Desktop is not installed.");
+    if (!g_manager.pkg.found) {
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"Claude Desktop is not installed."));
         return;
     }
-    hr = Launcher_Open(&g.pkg, &p, NULL, NULL, &identity);
+    hr = Launcher_Open(&g_manager.pkg, &p, NULL, NULL, &identity);
     if (FAILED(hr)) {
-        Util_Message(g.dlg, MB_ICONERROR, L"Claude could not be started (error 0x%08lX).", (unsigned long)hr);
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"Claude could not be started (error 0x%08lX)."), (unsigned long)hr);
         return;
     }
     Util_Log(L"opened %s from the manager%s", p.folder, identity ? L"" : L" without package identity");
@@ -760,84 +841,98 @@ static void OpenProfile(const Profile *profile)
 
 static void DoOpen(void)
 {
-    const Profile *sel = Selected();
-    if (sel) OpenProfile(sel);
+    const Profile *selected = SelectedProfile();
+    if (selected) OpenProfile(selected);
 }
 
 static int FreeColor(void)
 {
     BOOL used[PALETTE_SIZE] = { 0 };
     int i;
-    for (i = 0; i < g.profiles.count; i++)
-        if (g.profiles.items[i].color >= 0 && g.profiles.items[i].color < PALETTE_SIZE) used[g.profiles.items[i].color] = TRUE;
+    for (i = 0; i < g_manager.profiles.count; i++)
+        if (g_manager.profiles.items[i].color >= 0 && g_manager.profiles.items[i].color < PALETTE_SIZE)
+            used[g_manager.profiles.items[i].color] = TRUE;
     for (i = 0; i < PALETTE_SIZE; i++)
         if (!used[i]) return i;
-    return g.profiles.count % PALETTE_SIZE;
+    return g_manager.profiles.count % PALETTE_SIZE;
+}
+
+static void SetProfileStartup(const Profile *profile, BOOL enabled)
+{
+    if (FAILED(Shortcut_SetStartup(&g_manager.pkg, profile, enabled)))
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The Windows sign-in setting of \x201C%s\x201D could not be changed."), profile->name);
 }
 
 static void DoNew(void)
 {
-    ProfileDialog d;
-    Profile source;
-    WCHAR folder[FOLDER_CCH], err[256];
+    ProfileDialog dialog;
+    Profile source, created;
+    WCHAR folder[FOLDER_CCH], error[256];
     int i;
-    if (g.profiles.count >= MAX_PROFILES) {
-        Util_Message(g.dlg, MB_ICONINFORMATION, APP_NAME L" handles up to %d profiles.", MAX_PROFILES);
+    if (g_manager.profiles.count >= MAX_PROFILES) {
+        Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(APP_NAME L" handles up to %d profiles."), MAX_PROFILES);
         return;
     }
-    ZeroMemory(&d, sizeof d);
-    d.isNew = TRUE;
-    d.color = FreeColor();
-    d.openNow = g.pkg.found;
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.color = FreeColor();
+    dialog.openNow = g_manager.pkg.found;
     /* Settings come from the selected profile, else the default one. */
-    if (Selected()) source = *Selected();
-    else if (g.profiles.count > 0) source = g.profiles.items[Profiles_DefaultIndex(&g.profiles)];
-    else ZeroMemory(&source, sizeof source);
-    d.copyFrom = source.folder[0] ? &source : NULL;
-    if (Ui_Dialog(g.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&d) != IDOK || Quiet()) return;
-    if (!Profiles_Create(d.name, d.color, folder, ARRAYSIZE(folder), err, ARRAYSIZE(err))) {
-        Util_Message(g.dlg, MB_ICONWARNING, L"%s", err);
+    ZeroMemory(&source, sizeof source);
+    if (SelectedProfile()) source = *SelectedProfile();
+    else if ((i = Profiles_DefaultIndex(&g_manager.profiles)) >= 0) source = g_manager.profiles.items[i];
+    dialog.copyFrom = source.folder[0] ? &source : NULL;
+    if (Ui_Dialog(g_manager.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&dialog) != IDOK || StateChangesBlocked()) return;
+    FinishShellWork();
+    if (!Profiles_Create(dialog.name, dialog.color, folder, ARRAYSIZE(folder), error, ARRAYSIZE(error))) {
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, L"%s", error);
         return;
     }
-    Profiles_Load(&g.profiles);
-    FillList(folder);
-    i = Profiles_Find(&g.profiles, folder);
+    Refresh(FALSE);
+    i = Profiles_Find(&g_manager.profiles, folder);
     if (i < 0) {
-        Util_Message(g.dlg, MB_ICONWARNING, L"The profile was created but cannot be listed: " APP_NAME L" handles up to %d profiles.", MAX_PROFILES);
+        Ui_Message(g_manager.dlg, MB_ICONWARNING,
+                   TR(L"The profile was created but cannot be listed: " APP_NAME L" handles up to %d profiles."), MAX_PROFILES);
         return;
     }
-    if (d.copy) Profiles_CopySettings(&source, &g.profiles.items[i]);
-    if (d.startup) Shortcut_SetStartup(&g.pkg, &g.profiles.items[i], TRUE);
-    if (d.openNow) OpenProfile(&g.profiles.items[i]);
+    SelectProfileRow(folder);
+    ShowChanges();
+    created = g_manager.profiles.items[i];
+    if (dialog.copy) Profiles_CopySettings(&source, &created);
+    if (dialog.startup) SetProfileStartup(&created, TRUE);
+    if (dialog.openNow && !StateChangesBlocked()) OpenProfile(&created);
 }
 
 static void DoEdit(void)
 {
-    const Profile *sel = Selected();
+    const Profile *selected = SelectedProfile();
     Profile before, after;
-    ProfileDialog d;
+    ProfileDialog dialog;
     WCHAR icon[MAX_PATH];
     BOOL atStartup;
-    if (!sel) return;
-    before = *sel;
-    ZeroMemory(&d, sizeof d);
-    d.existing = &before;
-    d.color = before.color;
-    d.startup = atStartup = Shortcut_IsAtStartup(&before);
-    if (Ui_Dialog(g.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&d) != IDOK || Quiet()) return;
-    if (!Profiles_Update(before.folder, d.name, d.color)) {
-        Util_Message(g.dlg, MB_ICONERROR, L"The profile could not be saved.");
+    if (!selected) return;
+    before = *selected;
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.existing = &before;
+    dialog.color = before.color;
+    dialog.startup = atStartup = Shortcut_IsAtStartup(&before);
+    if (Ui_Dialog(g_manager.dlg, IDD_PROFILE, ProfileProc, (LPARAM)&dialog) != IDOK || StateChangesBlocked()) return;
+    FinishShellWork();
+    if (!Profiles_Update(before.folder, dialog.name, dialog.color)) {
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The profile could not be saved."));
         return;
     }
     after = before;
-    StringCchCopyW(after.name, ARRAYSIZE(after.name), d.name);
-    after.color = d.color;
-    if ((wcscmp(before.name, after.name) != 0 || before.color != after.color) &&
-        Icons_Ensure(&g.pkg, &after, icon, ARRAYSIZE(icon)))
-        ApplyBadge(&before, &after, icon);
-    if (d.startup != atStartup && FAILED(Shortcut_SetStartup(&g.pkg, &after, d.startup)))
-        Util_Message(g.dlg, MB_ICONWARNING, L"The Windows sign-in setting of \x201C%s\x201D could not be changed.", after.name);
+    StringCchCopyW(after.name, ARRAYSIZE(after.name), dialog.name);
+    after.color = dialog.color;
+    /* The list shows the new name and color first; its shortcuts and pins follow. */
     Refresh(FALSE);
+    ShowChanges();
+    if ((wcscmp(before.name, after.name) != 0 || before.color != after.color) &&
+        Icons_Ensure(&g_manager.pkg, &after, icon, ARRAYSIZE(icon)))
+        ApplyBadge(&before, &after, icon);
+    if (dialog.startup != atStartup) SetProfileStartup(&after, dialog.startup);
+    g_manager.shortcutStateFolder[0] = 0;
+    UpdateButtons();
 }
 
 static BOOL ConfirmDelete(const Profile *p)
@@ -845,71 +940,82 @@ static BOOL ConfirmDelete(const Profile *p)
     WCHAR text[512 + MAX_PATH], target[MAX_PATH];
     if (Profiles_LinkTarget(p, target, ARRAYSIZE(target)))
         StringCchPrintfW(text, ARRAYSIZE(text),
-                         L"Delete the profile \x201C%s\x201D?\n\nIts folder is a link to\n%s\nThe data in that folder stays on disk. The link, the profile's shortcuts and Claude's local files for it (logs and cache) are removed.",
+                         TR(L"Delete the profile \x201C%s\x201D?\n\nIts folder is a link to\n%s\nThe data in that folder stays on disk. The link, the profile's shortcuts and Claude's local files for it (logs and cache) are removed."),
                          p->name, target);
     else
         StringCchPrintfW(text, ARRAYSIZE(text),
-                         L"Delete the profile \x201C%s\x201D?\n\nIts data folder (sign-in, local history, Claude Code and Cowork files) goes to the Recycle Bin and its shortcuts are removed.",
+                         TR(L"Delete the profile \x201C%s\x201D?\n\nIts data folder (sign-in, local history, Claude Code and Cowork files) goes to the Recycle Bin and its shortcuts are removed."),
                          p->name);
-    return Ui_Ask(g.dlg, IDI_WARNING, text, L"Delete profile", L"Cancel", TRUE);
+    return Ui_Ask(g_manager.dlg, IDI_WARNING, text, TR(L"Delete profile"), TR(L"Cancel"), TRUE);
 }
 
 static BOOL RefuseIfRunning(const Profile *p)
 {
     if (!Claude_IsRunning(p)) return FALSE;
-    Util_Message(g.dlg, MB_ICONWARNING,
-                 L"Quit Claude for \x201C%s\x201D first (right-click its icon in the notification area, then Quit), then try again.",
-                 p->name);
+    Ui_Message(g_manager.dlg, MB_ICONWARNING,
+               TR(L"Quit Claude for the \x201C%s\x201D profile first (right-click its icon in the notification area and choose Quit), then try again."),
+               p->name);
     return TRUE;
 }
 
 static void DoDelete(void)
 {
-    const Profile *sel = Selected();
+    const Profile *selected = SelectedProfile();
     Profile p;
-    if (!sel || sel->isStock) return;
-    p = *sel;
+    if (!selected || selected->isStock) return;
+    p = *selected;
     if (RefuseIfRunning(&p)) return;
-    if (!ConfirmDelete(&p) || Quiet()) return;
+    if (!ConfirmDelete(&p) || StateChangesBlocked()) return;
     /* It may have been started while the question was open. */
     if (RefuseIfRunning(&p)) {
         Refresh(FALSE);
         return;
     }
-    /* Cancelled: the user answered No to Windows' "delete permanently?". */
-    if (Profiles_Delete(g.dlg, &p) == REMOVE_FAILED)
-        Util_Message(g.dlg, MB_ICONWARNING,
-                     L"\x201C%s\x201D could not be deleted completely. Make sure Claude is closed for this profile and try again.",
-                     p.name);
+    FinishShellWork();
+    /* REMOVE_CANCELLED (the user answered No to Windows' "delete
+     * permanently?") needs no message. */
+    if (Profiles_Delete(g_manager.dlg, &p) == REMOVE_FAILED)
+        Ui_Message(g_manager.dlg, MB_ICONWARNING,
+                   TR(L"\x201C%s\x201D could not be deleted completely. Make sure Claude is closed for this profile and try again."),
+                   p.name);
     Refresh(FALSE);
 }
 
+/* The registry watch reloads the profiles after the write (WatchOutside):
+ * the change shows here at once, without a second reload. */
 static void DoSetDefault(void)
 {
-    const Profile *sel = Selected();
-    if (!sel) return;
-    Profiles_SetDefault(sel->folder);
-    Refresh(FALSE);
+    const Profile *selected = SelectedProfile();
+    if (!selected) return;
+    if (!Profiles_SetDefault(selected->folder)) {
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The default profile could not be changed."));
+        return;
+    }
+    StringCchCopyW(g_manager.profiles.defaultFolder, ARRAYSIZE(g_manager.profiles.defaultFolder), selected->folder);
+    UpdateRowsAndButtons();
+    SessionsView_SetProfiles(&g_manager.profiles);
 }
 
 static void CreateShortcutAt(const Profile *p, const WCHAR *path)
 {
-    HRESULT hr = Shortcut_CreateForProfile(&g.pkg, p, path);
+    HRESULT hr;
+    FinishShellWork();
+    hr = Shortcut_CreateForProfile(&g_manager.pkg, p, path);
     if (FAILED(hr))
-        Util_Message(g.dlg, MB_ICONERROR, L"The shortcut could not be created (error 0x%08lX).", (unsigned long)hr);
-    g.checkedFolder[0] = 0;
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The shortcut could not be created (error 0x%08lX)."), (unsigned long)hr);
+    g_manager.shortcutStateFolder[0] = 0;
     UpdateButtons();
 }
 
 static void DoDesktopShortcut(void)
 {
-    const Profile *sel = Selected();
+    const Profile *selected = SelectedProfile();
     Profile p;
     WCHAR path[MAX_PATH];
-    if (!sel) return;
-    p = *sel;
+    if (!selected) return;
+    p = *selected;
     if (!Shortcut_DesktopPathFor(&p, path, ARRAYSIZE(path))) {
-        Util_Message(g.dlg, MB_ICONERROR, L"The desktop folder is not available.");
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The desktop folder is not available."));
         return;
     }
     CreateShortcutAt(&p, path);
@@ -917,16 +1023,17 @@ static void DoDesktopShortcut(void)
 
 static void DoPinTaskbar(void)
 {
-    const Profile *sel = Selected();
+    const Profile *selected = SelectedProfile();
     Profile p;
     HRESULT hr;
-    if (!sel) return;
-    p = *sel;
-    hr = TaskbarPin_Pin(&g.pkg, &p);
+    if (!selected) return;
+    p = *selected;
+    FinishShellWork();
+    hr = TaskbarPin_Pin(&g_manager.pkg, &p);
     if (FAILED(hr))
-        Util_Message(g.dlg, MB_ICONERROR, L"\x201C%s\x201D could not be pinned to the taskbar (error 0x%08lX).",
-                     p.name, (unsigned long)hr);
-    g.checkedFolder[0] = 0;
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"\x201C%s\x201D could not be pinned to the taskbar (error 0x%08lX)."),
+                   p.name, (unsigned long)hr);
+    g_manager.shortcutStateFolder[0] = 0;
     UpdateButtons();
 }
 
@@ -935,48 +1042,67 @@ static void DoPinTaskbar(void)
 static const int kProfileControls[] = { IDC_LIST, IDC_OPEN, IDC_NEW, IDC_EDIT, IDC_DELETE, IDC_DEFAULT, IDC_NOTE,
                                         IDC_SC_GROUP, IDC_SC_DESKTOP, IDC_SC_SAVEAS, IDC_SC_PIN, IDC_SC_START };
 
+static const WCHAR *SessionsButtonCaption(BOOL sessionsShown)
+{
+    return TR(Theme_MainCaption(IDC_SESSIONS, sessionsShown));
+}
+
+/* The view shown gets the focus before the other one hides. */
+void Gui_ShowSessions(HWND dialog, const ClaudePackage *package, BOOL showSessions, const WCHAR *folder)
+{
+    size_t i;
+    if (showSessions) {
+        SessionsView_Enter(package, folder);
+        FocusView(dialog, TRUE);
+        for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_HIDE);
+    } else {
+        for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(dialog, kProfileControls[i]), SW_SHOW);
+        FocusView(dialog, FALSE);
+        SessionsView_Leave();
+    }
+    SetDlgItemTextW(dialog, IDC_SESSIONS, SessionsButtonCaption(showSessions));
+    Theme_LayoutMain(dialog);
+    SessionsView_Resize();
+}
+
 static void ToggleSessions(void)
 {
-    BOOL sessions = !SessionsView_Shown();
-    size_t i;
-    if (sessions) {
-        const Profile *p = Selected();
-        for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(g.dlg, kProfileControls[i]), SW_HIDE);
-        SessionsView_Enter(&g.pkg, p ? p->folder : NULL);
-        SendMessageW(g.dlg, DM_SETDEFID, IDOK, 0);   /* no default button there: Enter opens the session (SessionsView_Command) */
+    if (!SessionsView_Shown()) {
+        const Profile *p = SelectedProfile();
+        Gui_ShowSessions(g_manager.dlg, &g_manager.pkg, TRUE, p ? p->folder : NULL);
     } else {
         WCHAR folder[FOLDER_CCH];
         StringCchCopyW(folder, ARRAYSIZE(folder), SessionsView_Profile());
-        SessionsView_Leave();
-        for (i = 0; i < ARRAYSIZE(kProfileControls); i++) ShowWindow(GetDlgItem(g.dlg, kProfileControls[i]), SW_SHOW);
-        FillList(folder);
-        SendMessageW(g.dlg, DM_SETDEFID, IDC_OPEN, 0);
-        SetFocus(g.list);
+        Gui_ShowSessions(g_manager.dlg, &g_manager.pkg, FALSE, folder);
+        SelectProfileRow(folder);   /* the profile the sessions view showed */
     }
-    SetDlgItemTextW(g.dlg, IDC_SESSIONS, sessions ? L"<  &Back" : L"&Sessions  >");
 }
 
 /* Adds the profile to the Start menu, or takes it out: looked up again
  * first, the entry may have changed since the button was drawn. */
 static void DoStartMenu(void)
 {
-    const Profile *sel = Selected();
+    const Profile *selected = SelectedProfile();
     Profile p;
     HRESULT hr;
-    if (!sel) return;
-    p = *sel;
+    if (!selected) return;
+    p = *selected;
+    FinishShellWork();
     if (Shortcut_IsInStartMenu(&p)) {
-        Shortcut_RemoveFromStartMenu(&p);
-    } else if (FAILED(hr = Shortcut_AddToStartMenu(&g.pkg, &p))) {
-        Util_Message(g.dlg, MB_ICONERROR, L"\x201C%s\x201D could not be added to the Start menu (error 0x%08lX).",
-                     p.name, (unsigned long)hr);
+        if (FAILED(hr = Shortcut_RemoveFromStartMenu(&p)))
+            Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"\x201C%s\x201D could not be removed from the Start menu (error 0x%08lX)."),
+                       p.name, (unsigned long)hr);
+    } else if (FAILED(hr = Shortcut_AddToStartMenu(&g_manager.pkg, &p))) {
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"\x201C%s\x201D could not be added to the Start menu (error 0x%08lX)."),
+                   p.name, (unsigned long)hr);
     }
-    g.checkedFolder[0] = 0;
+    g_manager.shortcutStateFolder[0] = 0;
     UpdateButtons();
 }
 
 /* The folders the shortcut, pin and Start menu buttons read: a change there
- * checks those buttons again, whoever made it. */
+ * checks those buttons again, whoever made it (interrupt level: also a file
+ * written without the shell). */
 static void WatchShortcutFolders(void)
 {
     const GUID *known[] = { &FOLDERID_Desktop, &FOLDERID_PublicDesktop, &FOLDERID_Programs };
@@ -995,17 +1121,21 @@ static void WatchShortcutFolders(void)
     if (Shortcut_StartMenuDir(start, ARRAYSIZE(start)) && (entries[n].pidl = ILCreateFromPathW(start)) != NULL)
         entries[n++].fRecursive = FALSE;
     if (n > 0)
-        g.shortcutsNotify = SHChangeNotifyRegister(g.dlg, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
-                                                   SHCNE_CREATE | SHCNE_DELETE | SHCNE_RENAMEITEM | SHCNE_UPDATEITEM | SHCNE_UPDATEDIR,
-                                                   WM_APP_SHORTCUTS, n, entries);
+        g_manager.shortcutsNotify = SHChangeNotifyRegister(g_manager.dlg, SHCNRF_ShellLevel | SHCNRF_InterruptLevel | SHCNRF_NewDelivery,
+                                                           SHCNE_CREATE | SHCNE_DELETE | SHCNE_RENAMEITEM | SHCNE_UPDATEITEM | SHCNE_UPDATEDIR,
+                                                           WM_APP_SHORTCUTS, n, entries);
+    /* Those buttons are then checked again only when the window is activated. */
+    if (!g_manager.shortcutsNotify)
+        Util_Log(L"the shortcut folders are not watched (%d of %d found)", n, (int)ARRAYSIZE(entries));
     for (i = 0; i < (size_t)n; i++) CoTaskMemFree((void *)entries[i].pidl);
 }
 
 /* What the window shows can change outside it: a profile folder made or
- * removed, a name or color written by another copy, the claude:// app picked
- * in Windows, Claude installed or updated. A thread waits for the matching
- * registry and folder notifications and tells the window, which refreshes
- * once for a burst of them. */
+ * removed, a name or color written by another copy, the default profile, the
+ * claude:// app picked in Windows, Claude installed or updated, a taskbar pin
+ * added or removed. A thread waits for the matching registry and folder
+ * notifications and tells the window, which refreshes once for a burst of
+ * them. */
 typedef struct OutsideKey {
     const WCHAR *path;
     BOOL         subtree;
@@ -1014,39 +1144,51 @@ typedef struct OutsideKey {
 } OutsideKey;
 
 static const OutsideKey kOutsideKeys[] = {
-    { REG_ROOT, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, CHANGE_PROFILES },
+    /* Its own values and subkeys only: Update and Shortcuts are the manager's own records. */
+    { REG_ROOT, FALSE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, CHANGE_PROFILES },
+    { REG_PROFILES, TRUE, REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, CHANGE_PROFILES },
     { L"Software\\Microsoft\\Windows\\Shell\\Associations\\UrlAssociations", TRUE,
       REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET, CHANGE_LINKS },
     { REG_PACKAGES, FALSE, REG_NOTIFY_CHANGE_NAME, CHANGE_PACKAGES },
+    { REG_TASKBAND, FALSE, REG_NOTIFY_CHANGE_LAST_SET, CHANGE_PINS },
 };
+
+/* Opens the key when needed and arms its notification. A key that does not
+ * exist or was deleted stays closed and is tried again after the next change
+ * the thread sees: for Profiles (missing before the first profile), REG_ROOT's
+ * watch reports the change that creates it. */
+static void ArmOutsideKey(const OutsideKey *source, HKEY *key, HANDLE event)
+{
+    if (!*key && RegOpenKeyExW(HKEY_CURRENT_USER, source->path, 0, KEY_NOTIFY, key) != ERROR_SUCCESS) {
+        *key = NULL;
+        return;
+    }
+    if (RegNotifyChangeKeyValue(*key, source->subtree, source->filter, event, TRUE) != ERROR_SUCCESS) {
+        RegCloseKey(*key);
+        *key = NULL;
+    }
+}
 
 static DWORD WINAPI WatchOutside(void *param)
 {
-    HWND dlg = (HWND)param;
+    HWND dialog = (HWND)param;
     HANDLE handles[ARRAYSIZE(kOutsideKeys) + 2], dirs = INVALID_HANDLE_VALUE;
     HKEY keys[ARRAYSIZE(kOutsideKeys) + 2] = { 0 };
     LONG changes[ARRAYSIZE(kOutsideKeys) + 2];
     const OutsideKey *which[ARRAYSIZE(kOutsideKeys) + 2] = { 0 };
     WCHAR appData[MAX_PATH];
-    DWORD n = 0, i, w;
-    size_t k;
+    DWORD n = 0, i, k, signaled;
 
-    handles[n] = g.outsideStop;
+    handles[n] = g_manager.outsideStop;
     changes[n++] = 0;
     for (k = 0; k < ARRAYSIZE(kOutsideKeys); k++) {
-        HKEY key;
-        HANDLE event;
-        if (RegOpenKeyExW(HKEY_CURRENT_USER, kOutsideKeys[k].path, 0, KEY_NOTIFY, &key) != ERROR_SUCCESS) continue;
-        event = CreateEventW(NULL, FALSE, FALSE, NULL);
-        if (!event || RegNotifyChangeKeyValue(key, kOutsideKeys[k].subtree, kOutsideKeys[k].filter, event, TRUE) != ERROR_SUCCESS) {
-            if (event) CloseHandle(event);
-            RegCloseKey(key);
-            continue;
-        }
+        HANDLE event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!event) continue;
         handles[n] = event;
-        keys[n] = key;
         which[n] = &kOutsideKeys[k];
-        changes[n++] = kOutsideKeys[k].change;
+        changes[n] = kOutsideKeys[k].change;
+        ArmOutsideKey(which[n], &keys[n], event);
+        n++;
     }
     /* Profile folders sit directly in %APPDATA%. */
     if (Util_AppData(appData, ARRAYSIZE(appData)) &&
@@ -1056,133 +1198,169 @@ static DWORD WINAPI WatchOutside(void *param)
     }
 
     for (;;) {
-        w = WaitForMultipleObjects(n, handles, FALSE, INFINITE);
-        if (w == WAIT_OBJECT_0 || w >= WAIT_OBJECT_0 + n) break;
-        i = w - WAIT_OBJECT_0;
-        /* Armed again first, so a change during the refresh still counts. */
-        if (handles[i] == dirs) FindNextChangeNotification(dirs);
-        else RegNotifyChangeKeyValue(keys[i], which[i]->subtree, which[i]->filter, handles[i], TRUE);
-        if (InterlockedOr(&g_outside, changes[i]) == 0) PostMessageW(dlg, WM_APP_OUTSIDE, 0, 0);
+        signaled = WaitForMultipleObjects(n, handles, FALSE, INFINITE);
+        if (signaled == WAIT_OBJECT_0 || signaled >= WAIT_OBJECT_0 + n) break;
+        i = signaled - WAIT_OBJECT_0;
+        /* Armed again first, so a change during the refresh still counts;
+         * a key missing until now may exist. A folder watch that cannot be
+         * armed again would stay signaled: it is dropped (it is the last). */
+        if (handles[i] == dirs && !FindNextChangeNotification(dirs)) {
+            Util_Log(L"the profile folders are no longer watched (error %lu)", GetLastError());
+            FindCloseChangeNotification(dirs);
+            dirs = INVALID_HANDLE_VALUE;
+            n--;
+        }
+        for (k = 1; k < n; k++)
+            if (which[k] && (k == i || !keys[k])) ArmOutsideKey(which[k], &keys[k], handles[k]);
+        if (InterlockedOr(&g_outside, changes[i]) == 0) PostMessageW(dialog, WM_APP_OUTSIDE, 0, 0);
     }
 
     for (i = 1; i < n; i++) {
         if (handles[i] == dirs) {
             FindCloseChangeNotification(dirs);
         } else {
-            RegCloseKey(keys[i]);
+            if (keys[i]) RegCloseKey(keys[i]);
             CloseHandle(handles[i]);
         }
     }
     return 0;
 }
 
-static void StartWatchingOutside(HWND d)
+static void StartWatchingOutside(HWND dialog)
 {
-    g.outsideStop = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (g.outsideStop) g.outsideThread = CreateThread(NULL, 0, WatchOutside, d, 0, NULL);
+    g_manager.outsideStop = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (g_manager.outsideStop) g_manager.outsideThread = CreateThread(NULL, 0, WatchOutside, dialog, 0, NULL);
 }
 
 static void StopWatchingOutside(void)
 {
-    if (g.outsideStop) SetEvent(g.outsideStop);
-    if (g.outsideThread) {
-        WaitForSingleObject(g.outsideThread, 2000);
-        CloseHandle(g.outsideThread);
+    if (g_manager.outsideStop) SetEvent(g_manager.outsideStop);
+    if (g_manager.outsideThread) {
+        /* The worker posts UI notifications and never waits for this thread. */
+        WaitForSingleObject(g_manager.outsideThread, INFINITE);
+        CloseHandle(g_manager.outsideThread);
     }
-    if (g.outsideStop) CloseHandle(g.outsideStop);
-    g.outsideThread = g.outsideStop = NULL;
+    if (g_manager.outsideStop) CloseHandle(g_manager.outsideStop);
+    g_manager.outsideThread = g_manager.outsideStop = NULL;
 }
 
 static void DoSaveShortcut(void)
 {
-    const Profile *sel = Selected();
+    const Profile *selected = SelectedProfile();
     Profile p;
-    IFileSaveDialog *fd = NULL;
-    IShellItem *folder = NULL, *item = NULL;
-    COMDLG_FILTERSPEC spec = { L"Shortcut (*.lnk)", L"*.lnk" };
+    IFileSaveDialog *saveDialog = NULL;
+    IShellItem *desktop = NULL, *result = NULL;
+    COMDLG_FILTERSPEC filter = { TR(L"Shortcut (*.lnk)"), L"*.lnk" };
     WCHAR name[MAX_PATH], path[MAX_PATH];
     PWSTR chosen = NULL;
-    FILEOPENDIALOGOPTIONS opts = 0;
+    FILEOPENDIALOGOPTIONS options = 0;
+    HRESULT hr;
 
-    if (!sel) return;
-    p = *sel;
-    if (FAILED(CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog, (void **)&fd)))
+    if (!selected) return;
+    p = *selected;
+    hr = CoCreateInstance(&CLSID_FileSaveDialog, NULL, CLSCTX_INPROC_SERVER, &IID_IFileSaveDialog, (void **)&saveDialog);
+    if (FAILED(hr)) {
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The shortcut could not be created (error 0x%08lX)."), (unsigned long)hr);
         return;
-    Core_ShortcutFileName(p.name, 1, name, ARRAYSIZE(name));
-    IFileSaveDialog_SetTitle(fd, L"Create shortcut");
-    IFileSaveDialog_SetFileTypes(fd, 1, &spec);
-    IFileSaveDialog_SetDefaultExtension(fd, L"lnk");
-    IFileSaveDialog_SetFileName(fd, name);
-    if (SUCCEEDED(IFileSaveDialog_GetOptions(fd, &opts)))
-        IFileSaveDialog_SetOptions(fd, opts | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_NODEREFERENCELINKS | FOS_PATHMUSTEXIST);
-    if (SUCCEEDED(SHCreateItemInKnownFolder(&FOLDERID_Desktop, 0, NULL, &IID_IShellItem, (void **)&folder))) {
-        IFileSaveDialog_SetDefaultFolder(fd, folder);
-        IShellItem_Release(folder);
     }
-    if (SUCCEEDED(IFileSaveDialog_Show(fd, g.dlg)) && !Quiet() && SUCCEEDED(IFileSaveDialog_GetResult(fd, &item))) {
-        if (SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_FILESYSPATH, &chosen)) && chosen) {
-            if (SUCCEEDED(StringCchCopyW(path, ARRAYSIZE(path), chosen)) &&
-                (Core_EndsWithI(path, L".lnk") || SUCCEEDED(StringCchCatW(path, ARRAYSIZE(path), L".lnk"))))
+    Core_ShortcutFileName(p.name, 1, name, ARRAYSIZE(name));
+    IFileSaveDialog_SetTitle(saveDialog, TR(L"Create shortcut"));
+    IFileSaveDialog_SetFileTypes(saveDialog, 1, &filter);
+    IFileSaveDialog_SetDefaultExtension(saveDialog, L"lnk");
+    IFileSaveDialog_SetFileName(saveDialog, name);
+    if (SUCCEEDED(IFileSaveDialog_GetOptions(saveDialog, &options)))
+        IFileSaveDialog_SetOptions(saveDialog, options | FOS_OVERWRITEPROMPT | FOS_FORCEFILESYSTEM | FOS_NODEREFERENCELINKS | FOS_PATHMUSTEXIST);
+    if (SUCCEEDED(SHCreateItemInKnownFolder(&FOLDERID_Desktop, 0, NULL, &IID_IShellItem, (void **)&desktop))) {
+        IFileSaveDialog_SetDefaultFolder(saveDialog, desktop);
+        IShellItem_Release(desktop);
+    }
+    hr = IFileSaveDialog_Show(saveDialog, g_manager.dlg);
+    if (SUCCEEDED(hr) && !StateChangesBlocked() && SUCCEEDED(hr = IFileSaveDialog_GetResult(saveDialog, &result))) {
+        if (SUCCEEDED(hr = IShellItem_GetDisplayName(result, SIGDN_FILESYSPATH, &chosen))) {
+            if (FAILED(StringCchCopyW(path, ARRAYSIZE(path), chosen)) ||
+                (!Core_EndsWithI(path, L".lnk") && FAILED(StringCchCatW(path, ARRAYSIZE(path), L".lnk"))))
+                Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The path is too long."));
+            else
                 CreateShortcutAt(&p, path);
             CoTaskMemFree(chosen);
         }
-        IShellItem_Release(item);
+        IShellItem_Release(result);
     }
-    IFileSaveDialog_Release(fd);
+    if (FAILED(hr) && hr != HRESULT_FROM_WIN32(ERROR_CANCELLED))
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(L"The shortcut could not be created (error 0x%08lX)."), (unsigned long)hr);
+    IFileSaveDialog_Release(saveDialog);
+}
+
+/* An uninstall cancelled, or refused by Install_Uninstall (which said why):
+ * the window shows the state again. */
+static void EndUninstallAttempt(void)
+{
+    g_manager.uninstallInProgress = FALSE;
+    if (StateChangesBlocked()) return;
+    g_manager.shortcutStateFolder[0] = 0;
+    Refresh(TRUE);
+    ShowVersion();
 }
 
 /* Works on a private copy of the list: the dialog's choices are indexed on
- * it, and nothing reloads it until the end. */
+ * it, and nothing reloads it until the end. Not while the new release
+ * downloads or installs: its thread still writes the download. */
 static void DoUninstall(void)
 {
-    UninstallDialog u;
-    ProfileList snap;
+    UninstallDialog dialog;
+    ProfileList snapshot;
     WCHAR stock[LABEL_CCH];
-    int s;
+    int stockIndex;
 
-    if (g.busy || g.uninstalled) return;
+    if (g_manager.uninstallInProgress || g_manager.uninstalled) return;
+    if (g_manager.updating) {
+        Ui_Message(g_manager.dlg, MB_ICONINFORMATION, TR(APP_NAME L" is being updated. Try again once the update is done."));
+        return;
+    }
+    FinishShellWork();
     Refresh(TRUE);
-    snap = g.profiles;
-    ZeroMemory(&u, sizeof u);
-    u.list = &snap;
-    g.busy = TRUE;
-    if (Ui_Dialog(g.dlg, IDD_UNINSTALL, UninstallProc, (LPARAM)&u) != IDOK || g.closing) {
-        g.busy = FALSE;
+    snapshot = g_manager.profiles;
+    ZeroMemory(&dialog, sizeof dialog);
+    dialog.list = &snapshot;
+    g_manager.uninstallInProgress = TRUE;
+    if (Ui_Dialog(g_manager.dlg, IDD_UNINSTALL, UninstallProc, (LPARAM)&dialog) != IDOK || g_manager.closing) {
+        EndUninstallAttempt();
         return;
     }
-    Claude_UpdateRunning(&snap);
-    s = Profiles_Find(&snap, STOCK_FOLDER);
-    StringCchCopyW(stock, ARRAYSIZE(stock), s >= 0 ? snap.items[s].name : STOCK_DEFAULT_NAME);
-    if (!Install_Uninstall(g.dlg, &snap, u.removeData)) {
-        g.busy = FALSE;
-        Refresh(TRUE);
+    Claude_UpdateRunning(&snapshot);
+    stockIndex = Profiles_Find(&snapshot, STOCK_FOLDER);
+    StringCchCopyW(stock, ARRAYSIZE(stock), stockIndex >= 0 ? snapshot.items[stockIndex].name : STOCK_DEFAULT_NAME);
+    if (!Install_Uninstall(g_manager.dlg, &snapshot, dialog.removeData)) {
+        EndUninstallAttempt();
         return;
     }
-    g.uninstalled = TRUE;
-    g.busy = FALSE;
-    Util_Message(g.dlg, MB_ICONINFORMATION,
-                 APP_NAME L" has been removed.\n\nClaude Desktop and its \x201C%s\x201D profile are untouched.", stock);
-    EndDialog(g.dlg, 0);
+    g_manager.uninstalled = TRUE;
+    g_manager.uninstallInProgress = FALSE;
+    Ui_Message(g_manager.dlg, MB_ICONINFORMATION,
+               TR(APP_NAME L" has been removed.\n\nClaude Desktop and its \x201C%s\x201D profile are untouched."), stock);
+    EndDialog(g_manager.dlg, 0);
 }
 
-/* Dialogs this window owns (directly or through another dialog). */
-static BOOL CALLBACK CloseOwnedProc(HWND w, LPARAM lp)
+/* Whether `owner` owns `window`, directly or through other windows. */
+static BOOL OwnedBy(HWND window, HWND owner)
 {
-    HWND owner;
-    for (owner = GetWindow(w, GW_OWNER); owner; owner = GetWindow(owner, GW_OWNER)) {
-        if (owner == (HWND)lp) {
-            PostMessageW(w, WM_CLOSE, 0, 0);
-            break;
-        }
-    }
+    HWND above;
+    for (above = window ? GetWindow(window, GW_OWNER) : NULL; above; above = GetWindow(above, GW_OWNER))
+        if (above == owner) return TRUE;
+    return FALSE;
+}
+
+static BOOL CALLBACK CloseOwnedProc(HWND window, LPARAM owner)
+{
+    if (OwnedBy(window, (HWND)owner)) PostMessageW(window, WM_CLOSE, 0, 0);
     return TRUE;
 }
 
-static void Close(HWND d)
+static void Close(HWND dialog)
 {
-    g.closing = TRUE;
-    EnumThreadWindows(GetCurrentThreadId(), CloseOwnedProc, (LPARAM)d);
-    EndDialog(d, 0);
+    g_manager.closing = TRUE;
+    EnumThreadWindows(GetCurrentThreadId(), CloseOwnedProc, (LPARAM)dialog);
+    EndDialog(dialog, 0);
 }
 
 /* Only the user can make Claude Desktop Profiles Manager the app for
@@ -1191,218 +1369,391 @@ static void Close(HWND d)
 static void SetUpLinks(void)
 {
     WCHAR exe[MAX_PATH];
-    if (!g.pkg.found || Handler_UserChoice() == USERCHOICE_OURS) return;
-    if (!Ui_Ask(g.dlg, IDI_INFORMATION,
-                L"Windows now asks which app opens Claude links.\n\n"
-                L"Choose \x201C" APP_NAME L"\x201D, then Always (or Set default). Sign-ins then always come back to the window that started them.",
-                L"Continue", L"Later", FALSE))
+    if (!g_manager.pkg.found || Handler_UserChoice() == USERCHOICE_OURS) return;
+    if (!Ui_Ask(g_manager.dlg, IDI_INFORMATION,
+                TR(L"Windows now asks which app opens claude:// links.\n\n"
+                   L"Choose \x201C" APP_NAME L"\x201D, then Always (or Set default). Sign-ins then always come back to the window that started them."),
+                TR(L"Continue"), TR(L"Later"), FALSE))
         return;
-    if (Util_InstallExe(exe, ARRAYSIZE(exe))) Handler_Register(exe);
+    /* Unregistered, the program would not be in the list the user is sent to. */
+    if (!Util_InstallExe(exe, ARRAYSIZE(exe)) || !Handler_Register(exe)) {
+        Util_Log(L"could not register for claude:// links (error %lu)", GetLastError());
+        Ui_Message(g_manager.dlg, MB_ICONERROR, TR(APP_NAME L" could not be registered as an app for claude:// links."));
+        return;
+    }
     if (!Handler_AskUser())
-        Util_Message(g.dlg, MB_ICONWARNING,
-                     L"Windows kept the app it uses for Claude links.\n\n"
-                     L"Open Settings > Apps > Default apps > Choose defaults by link type, find CLAUDE and choose \x201C" APP_NAME L"\x201D.");
+        Ui_Message(g_manager.dlg, MB_ICONWARNING,
+                   TR(L"Windows kept the app it uses for claude:// links.\n\n"
+                      L"Open Settings > Apps > Default apps > Choose defaults by link type, find CLAUDE and choose \x201C" APP_NAME L"\x201D."));
     UpdateStatus();
 }
 
-static void DoFix(void)
+static void DoStatusAction(void)
 {
-    if (g.fix == FIX_GET_CLAUDE) Util_OpenUrl(APP_DOWNLOAD_URL);
-    else if (g.fix == FIX_LINKS) SetUpLinks();
+    if (g_manager.statusAction == STATUS_ACTION_GET_CLAUDE) Util_OpenUrl(APP_DOWNLOAD_URL);
+    else if (g_manager.statusAction == STATUS_ACTION_SET_UP_LINKS) SetUpLinks();
 }
 
 /* ------------------------------------------------------------ new release */
 
+/* The footer while the new release downloads or installs. */
+static void ShowUpdateProgress(void)
+{
+    WCHAR version[32], text[128];
+    if (g_manager.installing) {
+        SetTextIfChanged(IDC_ABOUT, TR(Theme_MainFooter(MAIN_FOOTER_INSTALLING)));
+    } else if (Update_Available(version, ARRAYSIZE(version))) {
+        StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainFooter(MAIN_FOOTER_DOWNLOADING)), version);
+        SetTextIfChanged(IDC_ABOUT, text);
+    }
+}
+
 /* A newer release shows next to the version, with its Update button. */
 static void ShowUpdate(void)
 {
-    WCHAR version[32], text[128];
-    RECT r = { 94, 249, 266, 259 };
-    if (g.updating || !Update_Available(version, ARRAYSIZE(version))) return;
-    StringCchPrintfW(text, ARRAYSIZE(text), L"Version " APP_VERSION_WSTR L" \x00B7 version %s is available", version);
+    WCHAR version[32], text[256];
+    if (g_manager.updating || !Update_Available(version, ARRAYSIZE(version))) return;
+    StringCchPrintfW(text, ARRAYSIZE(text), TR(Theme_MainFooter(MAIN_FOOTER_AVAILABLE)), APP_VERSION_WSTR, version);
     SetTextIfChanged(IDC_ABOUT, text);
-    MapDialogRect(g.dlg, &r);
-    SetWindowPos(GetDlgItem(g.dlg, IDC_ABOUT), NULL, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
-    ShowWindow(GetDlgItem(g.dlg, IDC_UPDATE), SW_SHOW);
+    EnableControl(IDC_UPDATE, TRUE);   /* an update that failed or was dropped turned it off */
+    ShowOptionalButton(IDC_UPDATE, TRUE);
 }
 
 static void DoUpdate(void)
 {
-    WCHAR version[32], text[128];
-    if (g.updating || !Update_Available(version, ARRAYSIZE(version))) return;
-    g.updating = TRUE;
-    Enable(IDC_UPDATE, FALSE);
-    StringCchPrintfW(text, ARRAYSIZE(text), L"Downloading version %s\x2026", version);
-    SetTextIfChanged(IDC_ABOUT, text);
-    Update_Download(g.dlg, WM_APP_DOWNLOADED);
+    WCHAR version[32];
+    if (g_manager.updating || !Update_Available(version, ARRAYSIZE(version))) return;
+    g_manager.updating = TRUE;
+    EnableControl(IDC_UPDATE, FALSE);
+    ShowUpdateProgress();
+    Update_Download(g_manager.dlg, WM_APP_DOWNLOADED);
 }
 
-/* The new release installs itself and closes this window. */
-static void Downloaded(UpdateResult result)
+static void ShowVersion(void)
 {
-    if (result == UPDATE_READY && Update_Run()) {
-        SetTextIfChanged(IDC_ABOUT, L"Installing the new version\x2026");
+    WCHAR text[512];
+    if (g_manager.updating) {
+        ShowUpdateProgress();
         return;
     }
-    g.updating = FALSE;
-    Enable(IDC_UPDATE, TRUE);
-    if (result == UPDATE_NOT_SIGNED)
-        Util_Message(g.dlg, MB_ICONWARNING,
-                     L"The new version was not installed: the downloaded file is not signed by the author of " APP_NAME L".");
-    else if (Util_Message(g.dlg, MB_ICONWARNING | MB_YESNO, L"The new version could not be downloaded.\n\nOpen its download page?") == IDYES)
-        Util_OpenUrl(APP_RELEASES_URL);
+    StringCchPrintfW(text, ARRAYSIZE(text),
+                     TR(Theme_MainFooter(MAIN_FOOTER_CREDITS)),
+                     APP_VERSION_WSTR, APP_AUTHOR_URL);
+    SetTextIfChanged(IDC_ABOUT, text);
     ShowUpdate();
+}
+
+static void SetColumnTitles(void)
+{
+    LVCOLUMNW column;
+    const WCHAR *title;
+    int i;
+    ZeroMemory(&column, sizeof column);
+    column.mask = LVCF_TEXT;
+    for (i = 0; (title = Theme_ProfileColumnTitle(i)) != NULL; i++) {
+        column.pszText = (LPWSTR)TR(title);
+        ListView_SetColumn(g_manager.list, i, &column);
+    }
+}
+
+static void DoLanguage(void)
+{
+    HMENU menu;
+    RECT button;
+    UINT command;
+    int i, choice, languageBefore = Localize_EffectiveLanguage();
+    if (StateChangesBlocked()) return;
+    menu = CreatePopupMenu();
+    if (!menu) return;
+    AppendMenuW(menu, MF_STRING | (Localize_CurrentLanguage() < 0 ? MF_CHECKED : 0), 1, Localize_LanguageName(-1));
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    for (i = 0; i < Localize_LanguageCount(); i++)
+        AppendMenuW(menu, MF_STRING | (Localize_CurrentLanguage() == i ? MF_CHECKED : 0),
+                    (UINT_PTR)(i + 2), Localize_LanguageName(i));
+    GetWindowRect(GetDlgItem(g_manager.dlg, IDC_LANGUAGE), &button);
+    command = Theme_TrackDropDown(g_manager.dlg, menu, &button);
+    DestroyMenu(menu);
+    /* The window may have been asked to close while the menu was open. */
+    if (!command || StateChangesBlocked()) return;
+    choice = command == 1 ? -1 : (int)command - 2;
+    FinishShellWork();   /* the previous language's, written in that language */
+    if (!Localize_SetLanguage(choice, TRUE)) {
+        Ui_Message(g_manager.dlg, MB_ICONWARNING, TR(L"The language preference could not be saved."));
+        return;
+    }
+    Localize_Window(g_manager.dlg);
+    Theme_Apply(g_manager.dlg);
+    SetColumnTitles();
+    SetTextIfChanged(IDC_SESSIONS, SessionsButtonCaption(SessionsView_Shown()));
+    /* The registry watch reloads the profiles after the write: only the texts change here. */
+    UpdateRowsAndButtons();
+    UpdateStatus();
+    ShowVersion();
+    ReflowMain();
+    SessionsView_Reload();
+    /* What Windows shows of the program speaks the new language too, in
+     * the background, once the window does. */
+    if (Localize_EffectiveLanguage() != languageBefore) {
+        ShowChanges();
+        StartLanguageWork();
+    }
+}
+
+/* The new release installs itself and closes this window. `error`: Windows'
+ * answer that goes with `result`. */
+static void Downloaded(UpdateResult result, DWORD error)
+{
+    BOOL openPage = FALSE;
+    if (StateChangesBlocked()) {
+        g_manager.updating = FALSE;
+        g_manager.installing = FALSE;
+        Update_RemoveDownload();
+        return;
+    }
+    if (result == UPDATE_READY) {
+        FinishShellWork();   /* the new copy replaces this one */
+        result = Update_Run(&error);
+    }
+    if (result == UPDATE_STARTED) {
+        g_manager.installing = TRUE;
+        ShowUpdateProgress();
+        return;
+    }
+    g_manager.updating = FALSE;
+    g_manager.installing = FALSE;
+    if (result == UPDATE_NOT_SIGNED)
+        Ui_Message(g_manager.dlg, MB_ICONWARNING,
+                   TR(L"The new version was not installed: the downloaded file is not signed by the author of " APP_NAME L"."));
+    else if (result == UPDATE_NOT_VERIFIED)
+        Ui_Message(g_manager.dlg, MB_ICONWARNING,
+                   TR(L"The new version was not installed: Windows could not check its signature (error 0x%08lX). Try again later."),
+                   (unsigned long)error);
+    else if (result == UPDATE_WRONG_VERSION)
+        Ui_Message(g_manager.dlg, MB_ICONWARNING,
+                   TR(L"The new version was not installed: the downloaded file is not the version that was announced."));
+    else if (result == UPDATE_NOT_STARTED)
+        openPage = Ui_Message(g_manager.dlg, MB_ICONWARNING | MB_YESNO,
+                              TR(L"The new version could not be started (error %lu).\n\nOpen its download page?"), error) == IDYES;
+    else if (error != ERROR_SUCCESS)
+        openPage = Ui_Message(g_manager.dlg, MB_ICONWARNING | MB_YESNO,
+                              TR(L"The new version could not be downloaded (error %lu).\n\nOpen its download page?"), error) == IDYES;
+    else
+        openPage = Ui_Message(g_manager.dlg, MB_ICONWARNING | MB_YESNO,
+                              TR(L"The new version could not be downloaded.\n\nOpen its download page?")) == IDYES;
+    if (openPage) Util_OpenUrl(APP_RELEASES_URL);
+    ShowVersion();
 }
 
 /* ----------------------------------------------------------- main window */
 
-static void SetIcons(HWND d)
+static void SetIcons(HWND dialog)
 {
-    UINT dpi = GetDpiForWindow(d);
+    UINT dpi = GetDpiForWindow(dialog);
     HICON big = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
                                   GetSystemMetricsForDpi(SM_CXICON, dpi), GetSystemMetricsForDpi(SM_CYICON, dpi), 0);
     HICON little = (HICON)LoadImageW(g_hInst, MAKEINTRESOURCEW(IDI_APP), IMAGE_ICON,
-                                    GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi), 0);
-    SendMessageW(d, WM_SETICON, ICON_BIG, (LPARAM)big);
-    SendMessageW(d, WM_SETICON, ICON_SMALL, (LPARAM)little);
-    if (g.bigIcon) DestroyIcon(g.bigIcon);
-    if (g.smallIcon) DestroyIcon(g.smallIcon);
-    g.bigIcon = big;
-    g.smallIcon = little;
+                                     GetSystemMetricsForDpi(SM_CXSMICON, dpi), GetSystemMetricsForDpi(SM_CYSMICON, dpi), 0);
+    SendMessageW(dialog, WM_SETICON, ICON_BIG, (LPARAM)big);
+    SendMessageW(dialog, WM_SETICON, ICON_SMALL, (LPARAM)little);
+    if (g_manager.bigIcon) DestroyIcon(g_manager.bigIcon);
+    if (g_manager.smallIcon) DestroyIcon(g_manager.smallIcon);
+    g_manager.bigIcon = big;
+    g_manager.smallIcon = little;
 }
 
 static void AddColumns(void)
 {
-    static const WCHAR *const titles[] = { L"Profile", L"Role", L"Data folder" };
-    LVCOLUMNW c;
+    LVCOLUMNW column;
     int i;
-    ZeroMemory(&c, sizeof c);
-    c.mask = LVCF_TEXT | LVCF_WIDTH;
-    for (i = 0; i < (int)ARRAYSIZE(titles); i++) {
-        c.pszText = (LPWSTR)titles[i];
-        c.cx = 60;
-        ListView_InsertColumn(g.list, i, &c);
-    }
+    ZeroMemory(&column, sizeof column);
+    column.mask = LVCF_WIDTH;
+    column.cx = FIRST_COLUMN_WIDTH;
+    for (i = 0; Theme_ProfileColumnTitle(i); i++) ListView_InsertColumn(g_manager.list, i, &column);
+    SetColumnTitles();
     LayoutColumns();
 }
 
-/* The profile buttons start level with the list's first row, under its
- * header, and keep their spacing (dialog units from the Open button). */
-static void LayoutSideButtons(void)
+static void LayoutMainControls(void)
 {
-    static const struct { int id, offset; } kButtons[] = { { IDC_OPEN, 0 }, { IDC_NEW, 21 }, { IDC_EDIT, 40 }, { IDC_DELETE, 59 } };
-    HWND header = ListView_GetHeader(g.list);
-    RECT top;
-    int i;
-    if (!header) return;
-    GetWindowRect(header, &top);
-    MapWindowPoints(NULL, g.dlg, (POINT *)&top, 2);
-    for (i = 0; i < (int)ARRAYSIZE(kButtons); i++) {
-        HWND button = GetDlgItem(g.dlg, kButtons[i].id);
-        RECT r, offset = { 0, 0, 0, kButtons[i].offset };
-        GetWindowRect(button, &r);
-        MapWindowPoints(NULL, g.dlg, (POINT *)&r, 2);
-        MapDialogRect(g.dlg, &offset);
-        SetWindowPos(button, NULL, r.left, top.bottom + offset.bottom, 0, 0, SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
-    }
+    if (!g_manager.layoutReady || g_manager.layingOut) return;
+    g_manager.layingOut = TRUE;
+    Theme_LayoutMain(g_manager.dlg);
+    LayoutColumns();
+    SessionsView_Resize();
+    g_manager.layingOut = FALSE;
 }
 
-static INT_PTR CALLBACK MainProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
+/* Fits the window to its controls in the current language, fonts and scale. */
+static void ReflowMain(void)
 {
-    switch (msg) {
+    Theme_FitDialog(g_manager.dlg);   /* places the controls too */
+    g_manager.layoutReady = TRUE;
+    LayoutColumns();
+    UpdateNote();
+    SessionsView_Resize();
+    SessionsView_Relayout();
+}
+
+static BOOL MainMinimumFrame(HWND dialog, SIZE *size)
+{
+    SIZE client;
+    RECT frame;
+    MONITORINFO monitor = { sizeof monitor };
+    if (!Theme_MainMinimum(dialog, &client)) return FALSE;
+    SetRect(&frame, 0, 0, client.cx, client.cy);
+    if (!AdjustWindowRectExForDpi(&frame, (DWORD)GetWindowLongW(dialog, GWL_STYLE), GetMenu(dialog) != NULL,
+                                  (DWORD)GetWindowLongW(dialog, GWL_EXSTYLE), GetDpiForWindow(dialog))) return FALSE;
+    size->cx = frame.right - frame.left;
+    size->cy = frame.bottom - frame.top;
+    if (GetMonitorInfoW(MonitorFromWindow(dialog, MONITOR_DEFAULTTONEAREST), &monitor)) {
+        size->cx = min(size->cx, monitor.rcWork.right - monitor.rcWork.left);
+        size->cy = min(size->cy, monitor.rcWork.bottom - monitor.rcWork.top);
+    }
+    return TRUE;
+}
+
+/* WM_GETMINMAXINFO and WM_DPICHANGED of a window made from IDD_MAIN: its
+ * minimum frame, and its place on a monitor with another scale. Returns
+ * whether the message was handled. */
+BOOL Gui_MainWindowGeometry(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    SIZE minimum = { 0, 0 };
+    (void)wp;
+    if (message == WM_GETMINMAXINFO) {
+        MINMAXINFO *info = (MINMAXINFO *)lp;
+        if (!info || !MainMinimumFrame(dialog, &minimum)) return FALSE;
+        info->ptMinTrackSize.x = minimum.cx;
+        info->ptMinTrackSize.y = minimum.cy;
+        return TRUE;
+    }
+    if (message == WM_DPICHANGED) {
+        const RECT *suggested = (const RECT *)lp;
+        Theme_Apply(dialog);
+        MainMinimumFrame(dialog, &minimum);
+        if (suggested) {
+            MONITORINFO monitor = { sizeof monitor };
+            int width = max(minimum.cx, suggested->right - suggested->left);
+            int height = max(minimum.cy, suggested->bottom - suggested->top);
+            int x = suggested->left, y = suggested->top;
+            if (GetMonitorInfoW(MonitorFromRect(suggested, MONITOR_DEFAULTTONEAREST), &monitor)) {
+                width = min(width, monitor.rcWork.right - monitor.rcWork.left);
+                height = min(height, monitor.rcWork.bottom - monitor.rcWork.top);
+                x = min(max(x, monitor.rcWork.left), monitor.rcWork.right - width);
+                y = min(max(y, monitor.rcWork.top), monitor.rcWork.bottom - height);
+            }
+            SetWindowPos(dialog, NULL, x, y, width, height, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static INT_PTR CALLBACK MainProc(HWND dialog, UINT message, WPARAM wp, LPARAM lp)
+{
+    switch (message) {
     case WM_INITDIALOG:
-        g.dlg = d;
-        g.list = GetDlgItem(d, IDC_LIST);
-        g.groupColor = -1;
-        SetIcons(d);
-        ListView_SetExtendedListViewStyle(g.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
+        g_manager.dlg = dialog;
+        Localize_Window(dialog);
+        g_manager.list = GetDlgItem(dialog, IDC_LIST);
+        g_manager.groupColor = -1;
+        SetIcons(dialog);
+        ListView_SetExtendedListViewStyle(g_manager.list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP);
         AddColumns();
-        g.listArea = Theme_SmoothView(g.list);
-        SessionsView_Init(d);
-        Theme_SetStrong(GetDlgItem(d, IDC_SESSIONS));   /* it leads to the other view */
-        Theme_Apply(d);
-        LayoutSideButtons();
-        SetDlgItemTextW(d, IDC_ABOUT, L"Version " APP_VERSION_WSTR L" \x00B7 by <a href=\"" APP_AUTHOR_URL L"\">Freenitial</a>, not affiliated with Anthropic");
-        Claude_FindPackage(&g.pkg);
-        Profiles_Load(&g.profiles);
+        Theme_SmoothView(g_manager.list);
+        SessionsView_Init(dialog);
+        Theme_SetStrong(GetDlgItem(dialog, IDC_SESSIONS));   /* it leads to the other view */
+        Theme_Apply(dialog);
+        Theme_RememberLayout(dialog);
+        ShowVersion();
+        Claude_FindPackage(&g_manager.pkg);
+        Profiles_Load(&g_manager.profiles, &g_manager.pkg);
+        SessionsView_SetProfiles(&g_manager.profiles);
         TaskbarPin_RepairOurs();
-        HealIcons(&g.profiles);
+        HealIcons(&g_manager.profiles);
         FillList(NULL);
         UpdateStatus();
+        ReflowMain();
         WatchShortcutFolders();
-        StartWatchingOutside(d);
+        StartWatchingOutside(dialog);
         /* Started to uninstall (Settings > Apps): only the uninstall dialog
          * shows, and the manager never opens (wParam 1). */
         if (lp == GUI_UNINSTALL) {
-            g.uninstallOnly = TRUE;
-            PostMessageW(d, WM_APP_UNINSTALL, 1, 0);
+            g_manager.uninstallOnly = TRUE;
+            PostMessageW(dialog, WM_APP_UNINSTALL, 1, 0);
         } else if (lp == GUI_SET_UP_LINKS) {
-            PostMessageW(d, WM_APP_SETUPLINKS, 0, 0);
+            PostMessageW(dialog, WM_APP_SETUPLINKS, 0, 0);
         }
-        if (lp != GUI_UNINSTALL) Update_Check(d, WM_APP_UPDATE);
-        SetFocus(g.list);
+        if (lp != GUI_UNINSTALL) Update_Check(dialog, WM_APP_UPDATE);
+        if (g_manager.readyEvent) SetEvent(g_manager.readyEvent);   /* a second launch can now find this window */
+        SetFocus(g_manager.list);
         return FALSE;
+
+    case WM_SHOWWINDOW:
+        if (wp && !g_manager.uninstallOnly) SessionsView_Warm(&g_manager.profiles);
+        break;
+
+    case WM_APP_SESSIONS_READY:
+        SessionsView_Ready(!StateChangesBlocked());
+        return TRUE;
 
     case WM_APP_OUTSIDE: {
         LONG changes = InterlockedExchange(&g_outside, 0);
-        if (!Quiet()) {
+        if (!StateChangesBlocked()) {
+            if (changes & CHANGE_PINS) g_manager.shortcutStateFolder[0] = 0;
+            /* The sessions view reloads by itself when its profiles change. */
             Refresh((changes & CHANGE_PACKAGES) != 0);
-            if (changes & CHANGE_PROFILES) SessionsView_Reload();
         }
         return TRUE;
     }
 
     case WM_APP_SESSIONS:
-        if (!Quiet()) SessionsView_Reload();
+        if (!StateChangesBlocked()) SessionsView_Reload();
         return TRUE;
 
     case WM_ACTIVATE:
-        /* Back to the window: the desktop shortcut or the pin may have been
-         * removed meanwhile, so their buttons are checked again. */
-        if (LOWORD(wp) != WA_INACTIVE && g.list && !Quiet()) {
-            g.checkedFolder[0] = 0;
-            Refresh(TRUE);
-            SessionsView_Reload();   /* which profiles run may have changed */
-            /* The dialog manager now gives focus back to the control that had
-             * it, which the refresh may just have hidden. */
-            PostMessageW(d, WM_APP_FIXFOCUS, 0, 0);
+        /* Back from another window: which profiles run may have changed, and
+         * the sessions view shows it; the shortcut, pin and Start menu state
+         * is read again (a folder that did not exist at start is not
+         * watched). Back from one of its own dialogs, the action that opened
+         * it refreshes what it changed. */
+        if (LOWORD(wp) != WA_INACTIVE && g_manager.list && !StateChangesBlocked() && !OwnedBy((HWND)lp, dialog)) {
+            g_manager.shortcutStateFolder[0] = 0;
+            Refresh(FALSE);
+            SessionsView_Reload();
+            /* The dialog manager then gives the focus back to the control
+             * that had it, which the refresh may just have hidden. */
+            PostMessageW(dialog, WM_APP_RESTORE_FOCUS, 0, 0);
         }
         break;
 
-    case WM_APP_FIXFOCUS: {
-        HWND button = GetDlgItem(d, IDC_FIX);
-        if (GetFocus() == button && !IsWindowVisible(button)) {
-            BOOL sessions = SessionsView_Shown();
-            SendMessageW(d, WM_NEXTDLGCTL, (WPARAM)(sessions ? GetDlgItem(d, IDC_S_TREE) : g.list), TRUE);
-            SendMessageW(d, DM_SETDEFID, sessions ? IDOK : IDC_OPEN, 0);
-        }
+    case WM_APP_RESTORE_FOCUS: {
+        HWND button = GetDlgItem(dialog, IDC_STATUS_ACTION);
+        if (GetFocus() == button && !IsWindowVisible(button)) FocusView(dialog, SessionsView_Shown());
         return TRUE;
     }
 
     case WM_NOTIFY: {
-        const NMHDR *h = (const NMHDR *)lp;
-        if (h->idFrom == IDC_ABOUT && (h->code == NM_CLICK || h->code == NM_RETURN)) {
+        const NMHDR *header = (const NMHDR *)lp;
+        if (header->idFrom == IDC_ABOUT && (header->code == NM_CLICK || header->code == NM_RETURN)) {
             Util_OpenUrl(APP_AUTHOR_URL);   /* the only link there */
             return TRUE;
         }
-        if (h->idFrom != IDC_LIST) {
+        if (header->idFrom != IDC_LIST) {
             LRESULT result;
-            if (!SessionsView_Notify(h, lp, &result)) break;
-            SetWindowLongPtrW(d, DWLP_MSGRESULT, result);
+            if (!SessionsView_Notify(header, &result)) break;
+            SetWindowLongPtrW(dialog, DWLP_MSGRESULT, result);
             return TRUE;
         }
-        if (h->code == NM_SETFOCUS || h->code == NM_KILLFOCUS) InvalidateRect(g.list, NULL, FALSE);
-        if (h->code == LVN_ITEMCHANGED) {
-            const NMLISTVIEW *nm = (const NMLISTVIEW *)lp;
+        if (header->code == NM_SETFOCUS || header->code == NM_KILLFOCUS) InvalidateRect(g_manager.list, NULL, FALSE);
+        if (header->code == LVN_ITEMCHANGED) {
+            const NMLISTVIEW *change = (const NMLISTVIEW *)lp;
             /* Selecting another row first deselects the old one: the buttons
              * follow once, when the list is done. */
-            if ((nm->uChanged & LVIF_STATE) && ((nm->uNewState ^ nm->uOldState) & LVIS_SELECTED) && !g.selectionPending) {
-                g.selectionPending = TRUE;
-                PostMessageW(d, WM_APP_SELECTION, 0, 0);
-            }
-        } else if (h->code == NM_DBLCLK) {
+            if ((change->uChanged & LVIF_STATE) && ((change->uNewState ^ change->uOldState) & LVIS_SELECTED))
+                PostOnce(&g_manager.selectionPending, WM_APP_SELECTION);
+        } else if (header->code == NM_DBLCLK) {
             if (((const NMITEMACTIVATE *)lp)->iItem >= 0) DoOpen();
-        } else if (h->code == LVN_KEYDOWN) {
+        } else if (header->code == LVN_KEYDOWN) {
             if (((const NMLVKEYDOWN *)lp)->wVKey == VK_DELETE) DoDelete();
         }
         break;
@@ -1410,22 +1761,23 @@ static INT_PTR CALLBACK MainProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
-        case IDC_OPEN:       DoOpen(); return TRUE;
-        case IDC_NEW:        DoNew(); return TRUE;
-        case IDC_EDIT:       DoEdit(); return TRUE;
-        case IDC_DELETE:     DoDelete(); return TRUE;
-        case IDC_DEFAULT:    DoSetDefault(); return TRUE;
-        case IDC_SC_DESKTOP: DoDesktopShortcut(); return TRUE;
-        case IDC_SC_SAVEAS:  DoSaveShortcut(); return TRUE;
-        case IDC_SC_PIN:     DoPinTaskbar(); return TRUE;
-        case IDC_SC_START:   DoStartMenu(); return TRUE;
-        case IDC_SESSIONS:   ToggleSessions(); return TRUE;
-        case IDC_UNINSTALL:  DoUninstall(); return TRUE;
-        case IDC_FIX:        DoFix(); return TRUE;
-        case IDC_UPDATE:     DoUpdate(); return TRUE;
+        case IDC_OPEN:          DoOpen(); return TRUE;
+        case IDC_NEW:           DoNew(); return TRUE;
+        case IDC_EDIT:          DoEdit(); return TRUE;
+        case IDC_DELETE:        DoDelete(); return TRUE;
+        case IDC_DEFAULT:       DoSetDefault(); return TRUE;
+        case IDC_SC_DESKTOP:    DoDesktopShortcut(); return TRUE;
+        case IDC_SC_SAVEAS:     DoSaveShortcut(); return TRUE;
+        case IDC_SC_PIN:        DoPinTaskbar(); return TRUE;
+        case IDC_SC_START:      DoStartMenu(); return TRUE;
+        case IDC_SESSIONS:      ToggleSessions(); return TRUE;
+        case IDC_UNINSTALL:     DoUninstall(); return TRUE;
+        case IDC_STATUS_ACTION: DoStatusAction(); return TRUE;
+        case IDC_UPDATE:        DoUpdate(); return TRUE;
+        case IDC_LANGUAGE:      DoLanguage(); return TRUE;
         case IDCANCEL:
             /* Esc in a search box that holds text clears it. */
-            if (!SessionsView_ClearSearch()) Close(d);
+            if (!SessionsView_ClearSearch()) Close(dialog);
             return TRUE;
         }
         if (SessionsView_Command(wp)) return TRUE;
@@ -1434,21 +1786,21 @@ static INT_PTR CALLBACK MainProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CLOSE:
         /* Also sent by an installer updating the program: close any dialog
          * that is open too, so the process really exits. */
-        Close(d);
+        Close(dialog);
         return TRUE;
 
     case WM_APP_UNINSTALL:
-        if (Quiet()) return TRUE;
-        if (!IsWindowEnabled(d)) {
-            g.pendingUninstall = TRUE;   /* a dialog is open: after it closes */
+        if (StateChangesBlocked()) return TRUE;
+        if (!IsWindowEnabled(dialog)) {
+            g_manager.pendingUninstall = TRUE;   /* a dialog is open: after it closes */
             return TRUE;
         }
         DoUninstall();
-        if (wp && g.uninstallOnly && !g.uninstalled && !g.closing) EndDialog(d, 0);
+        if (wp && g_manager.uninstallOnly && !g_manager.uninstalled && !g_manager.closing) EndDialog(dialog, 0);
         return TRUE;
 
     case WM_APP_SELECTION:
-        g.selectionPending = FALSE;
+        g_manager.selectionPending = FALSE;
         UpdateButtons();
         return TRUE;
 
@@ -1457,40 +1809,52 @@ static INT_PTR CALLBACK MainProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
         LONG event = 0;
         HANDLE lock = SHChangeNotification_Lock((HANDLE)wp, (DWORD)lp, &pidls, &event);
         if (lock) SHChangeNotification_Unlock(lock);
-        if (!Quiet()) {
-            g.checkedFolder[0] = 0;
+        PostOnce(&g_manager.shortcutsCheckPending, WM_APP_SHORTCUTS_CHECK);
+        return TRUE;
+    }
+
+    case WM_APP_SHORTCUTS_CHECK:
+        g_manager.shortcutsCheckPending = FALSE;
+        if (!StateChangesBlocked()) {
+            g_manager.shortcutStateFolder[0] = 0;
             UpdateButtons();
         }
         return TRUE;
-    }
 
     case WM_APP_UPDATE:
         ShowUpdate();
         return TRUE;
 
     case WM_APP_DOWNLOADED:
-        Downloaded((UpdateResult)wp);
+        Downloaded((UpdateResult)wp, (DWORD)lp);
         return TRUE;
 
     case WM_APP_SETUPLINKS:
-        if (!Quiet() && IsWindowEnabled(d)) {
-            /* The question that follows must be seen, with the manager behind it. */
-            if (!IsWindowVisible(d)) ShowWindow(d, SW_SHOWNORMAL);
-            SetForegroundWindow(d);
-            SetUpLinks();
+        if (StateChangesBlocked()) return TRUE;
+        if (!IsWindowEnabled(dialog)) {
+            g_manager.pendingSetUpLinks = TRUE;   /* a dialog is open: after it closes */
+            return TRUE;
         }
+        /* The question that follows must be seen, with the manager behind it. */
+        if (!IsWindowVisible(dialog)) ShowWindow(dialog, SW_SHOWNORMAL);
+        SetForegroundWindow(dialog);
+        SetUpLinks();
         return TRUE;
 
     case WM_APP_SHOW:
         /* Opening the manager while a Settings uninstall is on screen: show
          * the manager once that dialog is cancelled. */
-        g.uninstallOnly = FALSE;
+        g_manager.uninstallOnly = FALSE;
         return TRUE;
 
     case WM_ENABLE:
-        if (wp && g.pendingUninstall) {
-            g.pendingUninstall = FALSE;
-            PostMessageW(d, WM_APP_UNINSTALL, 0, 0);
+        if (wp && g_manager.pendingUninstall) {
+            g_manager.pendingUninstall = FALSE;
+            PostMessageW(dialog, WM_APP_UNINSTALL, 0, 0);
+        }
+        if (wp && g_manager.pendingSetUpLinks) {
+            g_manager.pendingSetUpLinks = FALSE;
+            PostMessageW(dialog, WM_APP_SETUPLINKS, 0, 0);
         }
         break;
 
@@ -1507,47 +1871,52 @@ static INT_PTR CALLBACK MainProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
         break;
 
     case WM_CTLCOLORLISTBOX:
-        if (GetDlgCtrlID((HWND)lp) == IDC_S_PROFILES) {   /* the sessions' side bar */
-            SetTextColor((HDC)wp, Theme_Color(THEME_TEXT));
-            SetBkColor((HDC)wp, Theme_Color(THEME_FACE));
-            return (INT_PTR)Theme_Brush(THEME_FACE);
-        }
-        return Theme_CtlColor(msg, wp, lp, IDC_ABOUT);
     case WM_CTLCOLORDLG:
     case WM_CTLCOLORSTATIC:
     case WM_CTLCOLORBTN:
     case WM_CTLCOLOREDIT:
-        return Theme_CtlColor(msg, wp, lp, IDC_ABOUT);
+        return Theme_CtlColor(message, wp, lp, IDC_ABOUT);
 
     case WM_SETTINGCHANGE:
     case WM_SYSCOLORCHANGE:
-        Theme_Follow(d, msg, wp, lp);
+        Theme_Follow(dialog, message, wp, lp);
+        break;
+
+    case WM_SIZE:
+        if (wp != SIZE_MINIMIZED) LayoutMainControls();
+        return TRUE;
+
+    case WM_GETMINMAXINFO:
+        if (Gui_MainWindowGeometry(dialog, message, wp, lp)) return TRUE;
         break;
 
     case WM_DPICHANGED:
-        PostMessageW(d, WM_APP_RELAYOUT, 0, 0);
-        break;
+        Gui_MainWindowGeometry(dialog, message, wp, lp);
+        PostMessageW(dialog, WM_APP_RELAYOUT, 0, 0);
+        return TRUE;
 
     case WM_APP_RELAYOUT: {
-        const Profile *p = Selected();
-        WCHAR sel[FOLDER_CCH] = L"";
-        if (p) StringCchCopyW(sel, ARRAYSIZE(sel), p->folder);
-        SetIcons(d);
-        LayoutSideButtons();
-        FillList(sel);
-        SessionsView_Relayout();
+        const Profile *p = SelectedProfile();
+        WCHAR selected[FOLDER_CCH] = L"";
+        if (p) StringCchCopyW(selected, ARRAYSIZE(selected), p->folder);
+        SetIcons(dialog);
+        ReflowMain();
+        FillList(selected);
         return TRUE;
     }
 
     case WM_DESTROY:
-        Theme_Forget(d);
+        g_manager.layoutReady = FALSE;
+        FinishShellWork();
+        Localize_ForgetWindow(dialog);
         StopWatchingOutside();
         SessionsView_Destroy();
-        if (g.shortcutsNotify) SHChangeNotifyDeregister(g.shortcutsNotify);
-        g.shortcutsNotify = 0;
-        if (g.bigIcon) DestroyIcon(g.bigIcon);
-        if (g.smallIcon) DestroyIcon(g.smallIcon);
-        g.bigIcon = g.smallIcon = NULL;
+        if (g_manager.shortcutsNotify) SHChangeNotifyDeregister(g_manager.shortcutsNotify);
+        g_manager.shortcutsNotify = 0;
+        if (g_manager.bigIcon) DestroyIcon(g_manager.bigIcon);
+        if (g_manager.smallIcon) DestroyIcon(g_manager.smallIcon);
+        if (g_manager.groupBadge) DestroyIcon(g_manager.groupBadge);
+        g_manager.bigIcon = g_manager.smallIcon = g_manager.groupBadge = NULL;
         break;
     }
     return FALSE;
@@ -1555,24 +1924,33 @@ static INT_PTR CALLBACK MainProc(HWND d, UINT msg, WPARAM wp, LPARAM lp)
 
 int Gui_Run(GuiStart start)
 {
-    INITCOMMONCONTROLSEX icc;
-    WNDCLASSEXW wc;
+    INITCOMMONCONTROLSEX controls;
+    WNDCLASSEXW windowClass;
     HANDLE mutex;
     HWND existing;
     WCHAR exe[MAX_PATH];
+    INT_PTR dialogResult;
 
     if (!Install_IsInstalledCopy()) {
         if (start != GUI_UNINSTALL) return Install_Run(TRUE) ? 0 : 1;
         if (Util_InstallExe(exe, ARRAYSIZE(exe)) && Util_FileExists(exe)) {
-            ShellExecuteW(NULL, L"open", exe, L"--uninstall", NULL, SW_SHOWNORMAL);
-            return 0;
+            DWORD error;
+            if ((INT_PTR)ShellExecuteW(NULL, L"open", exe, L"--uninstall", NULL, SW_SHOWNORMAL) > 32) return 0;
+            error = GetLastError();
+            Util_Log(L"could not start %s to uninstall (error %lu)", exe, error);
+            Ui_Message(NULL, MB_ICONERROR,
+                       TR(APP_NAME L" was installed but could not be started (error %lu):\n%s\n\nSecurity software may be blocking it."),
+                       error, exe);
+            return 1;
         }
-        Util_Message(NULL, MB_ICONINFORMATION, APP_NAME L" is not installed.");
+        Ui_Message(NULL, MB_ICONINFORMATION, TR(APP_NAME L" is not installed."));
         return 1;
     }
 
+    g_manager.readyEvent = CreateEventW(NULL, TRUE, FALSE, MANAGER_READY_EVENT);
     mutex = CreateMutexW(NULL, FALSE, MANAGER_MUTEX);
     if (mutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (g_manager.readyEvent) WaitForSingleObject(g_manager.readyEvent, MANAGER_READY_TIMEOUT_MS);
         existing = FindWindowW(APP_WINDOW_CLASS, NULL);
         if (existing) {
             /* A dialog open in the manager disables it: bring that forward. */
@@ -1585,29 +1963,34 @@ int Gui_Run(GuiStart start)
             if (start == GUI_SET_UP_LINKS) PostMessageW(existing, WM_APP_SETUPLINKS, 0, 0);
         }
         CloseHandle(mutex);
+        if (g_manager.readyEvent) CloseHandle(g_manager.readyEvent);
+        g_manager.readyEvent = NULL;
         return 0;
     }
 
     Install_Repair();
-    SetCurrentProcessExplicitAppUserModelID(APP_AUMID_PREFIX L"Manager");
+    SetCurrentProcessExplicitAppUserModelID(APP_MANAGER_AUMID);
 
-    icc.dwSize = sizeof icc;
-    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS;
-    InitCommonControlsEx(&icc);
+    controls.dwSize = sizeof controls;
+    controls.dwICC = ICC_LISTVIEW_CLASSES | ICC_TREEVIEW_CLASSES | ICC_BAR_CLASSES | ICC_STANDARD_CLASSES | ICC_LINK_CLASS;
+    InitCommonControlsEx(&controls);
 
-    ZeroMemory(&wc, sizeof wc);
-    wc.cbSize = sizeof wc;
-    wc.lpfnWndProc = DefDlgProcW;
-    wc.cbWndExtra = DLGWINDOWEXTRA;
-    wc.hInstance = g_hInst;
-    wc.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APP));
-    wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
-    wc.lpszClassName = APP_WINDOW_CLASS;
-    RegisterClassExW(&wc);
+    ZeroMemory(&windowClass, sizeof windowClass);
+    windowClass.cbSize = sizeof windowClass;
+    windowClass.lpfnWndProc = DefDlgProcW;
+    windowClass.cbWndExtra = DLGWINDOWEXTRA;
+    windowClass.hInstance = g_hInst;
+    windowClass.hIcon = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APP));
+    windowClass.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    windowClass.hbrBackground = (HBRUSH)(COLOR_3DFACE + 1);
+    windowClass.lpszClassName = APP_WINDOW_CLASS;
+    if (!RegisterClassExW(&windowClass)) Util_Log(L"could not register the manager's window class (error %lu)", GetLastError());
 
-    DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(IDD_MAIN), NULL, MainProc, (LPARAM)start);
+    dialogResult = DialogBoxParamW(g_hInst, MAKEINTRESOURCEW(IDD_MAIN), NULL, MainProc, (LPARAM)start);
+    if (dialogResult == -1) Util_Log(L"could not create the manager's window (error %lu)", GetLastError());
     if (mutex) CloseHandle(mutex);
-    if (g.uninstalled) Install_FinishUninstall();
-    return 0;
+    if (g_manager.readyEvent) CloseHandle(g_manager.readyEvent);
+    g_manager.readyEvent = NULL;
+    if (g_manager.uninstalled) Install_FinishUninstall();
+    return dialogResult == -1 ? 1 : 0;
 }

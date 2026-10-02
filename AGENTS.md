@@ -14,37 +14,8 @@ launching or routing.
 
 ## Layout
 
-```
-src/
-  app.h        shared declarations, constants, registry paths
-  core.c       pure helpers (no I/O): names, links, argument building, log parsing, routing decision
-  util.c       known folders, registry, log file, file reading, Recycle Bin
-  theme.c      the look of every window (light / dark / high contrast): palette, fonts, rows,
-               off-screen drawing, buttons, lists, edits, smooth scrolling; themed message box
-  claude.c     package discovery, ActivateApplication launch, running profiles, main.log reading
-  profiles.c   profile model: detection, create/rename/delete, Recycle Bin
-  icons.c      badged profile icons (GDI, hand-written .ico), badge, tray glyph
-  shortcuts.c  .lnk create/find/remove/refresh (IShellLink, AppUserModelID)
-  taskbar-pin.c taskbar pins: Taskband Favorites entry, pin updates, removal at uninstall (Taskbar Module, see LICENSE)
-  handler.c    claude:// registration, default-app (UserChoice) check
-  taskbar.c    per-profile taskbar buttons: window AppUserModelID, the --watch watcher (Taskbar Module)
-  tray.c       notification-area icon in the profile's color (Shell_NotifyIcon on Claude's icon)
-  install.c    install/repair/uninstall
-  update.c     new release check (GitHub API, WinHTTP) and one-click update
-  router.c     --launch and --url
-  gui.c        manager window and dialogs
-  sessionstore.c every profile's Claude Code sessions: entries, transcripts, projects, sessions in use (read only)
-  sessionedit.c  session actions: open, copy, entry changes, changes waiting for a profile to close, delete
-  sessions.c   the sessions view of the manager window: profiles, tree, details and their buttons, menu
-  main.c       command-line dispatch
-  app.rc, resource.h, app.manifest, app.ico, version.h
-tests/test_core.c   unit tests for core.c (run by build.cmd)
-tests/test_pin.c    unit tests for the Favorites entry helpers of taskbar-pin.c (run by build.cmd)
-tests/test_theme.c  checks what theme.c draws against Windows' own drawing (run by build.cmd)
-tests/test_claude.c checks the installed Claude Desktop still works as HOW-IT-WORKS.md says (run by build.cmd)
-tools/make-icon.ps1 regenerates src/app.ico
-docs/               HOW-IT-WORKS.md (technical doc) and screenshot.png (README image)
-```
+Every file and what it holds: [BUILD.md](BUILD.md#project-structure), "Project structure". `taskbar.c` and
+`taskbar-pin.c` are the Taskbar Module (rule 11).
 
 ## Rules that must hold
 
@@ -65,19 +36,23 @@ docs/               HOW-IT-WORKS.md (technical doc) and screenshot.png (README i
    links go to the window whose `main.log` last logged
    `[Auth] Using system browser for:`. No marker files, arm windows or
    "sign in" shortcuts.
-6. **Running detection is read-only**: `Chrome_MessageWindow` titles. Do not
-   open Chromium's `lockfile` (an exclusive open can make Claude think it is a
+6. **Running detection is read-only**: `Chrome_MessageWindow` titles, and
+   change notifications on a profile's folder to see it start. Do not open
+   Chromium's `lockfile` (an exclusive open can make Claude think it is a
    second instance).
 7. **Per-user only**: HKCU, `%LOCALAPPDATA%`, no admin rights, no services.
 8. **Never touch the user's running Claude instances** from tooling or tests;
    use throwaway profiles (`%APPDATA%\Claude-<test>`) and remove them after.
 9. **claude:// goes through the user's default-app choice.** Only Windows'
    chooser or Settings can set it (the choice is signed): never write
-   `UserChoice`/`UserChoiceLatest`. `HKCU\Software\Classes\claude` is Claude's
+   `UserChoice`/`UserChoiceLatest`. **Set up links** only deletes another
+   app's choice, so that Windows asks again. `HKCU\Software\Classes\claude` is Claude's
    own key (Claude rewrites it at every start); do not rely on it.
-10. **Pins are written by `taskbar-pin.c` only.** One Favorites entry per
-    profile, its extension blocks in Windows' layout. A pinned .lnk changes
-    only in place followed by the notifications the taskbar acts on
+10. **Pins are written by `taskbar-pin.c` only.** One entry per profile in
+    Windows' pin list, and one record per entry, both in the form Windows
+    writes them. A pinned .lnk is updated
+    in place, and renamed within the pins folder when its profile is
+    renamed, each followed by the notifications the taskbar acts on
     (`TaskbarPin_Refresh`); never unpin and pin again to update it. All pin
     code stays in `taskbar-pin.c`.
 11. **The Taskbar Module stays separate.** `taskbar-pin.c` and `taskbar.c`
@@ -86,9 +61,9 @@ docs/               HOW-IT-WORKS.md (technical doc) and screenshot.png (README i
     `shortcuts.c`, `icons.c` and `tray.c` (open source), and no session, theme
     or manager code goes in them.
 12. **Nothing polls.** The watcher and the manager act on events (window
-    shown or created, package list changed, Explorer restart, theme change,
-    focus, selection); a retry, a wait or an animation (a wheel scroll's)
-    after an event is bounded.
+    shown or created, a folder changed, package list changed, Explorer
+    restart, theme change, focus, selection); a retry, a wait or an animation
+    (a wheel scroll's) after an event is bounded.
 13. **A running profile's session entries are not written.** Claude keeps its
     sessions in memory and writes them back, so a change to a running
     profile waits in `pending-sessions-<folder>.txt` (`SessionEdit_Change`)
@@ -102,19 +77,27 @@ docs/               HOW-IT-WORKS.md (technical doc) and screenshot.png (README i
 - No third-party code; system DLLs only (`build.cmd` has the list). The CRT is
   static (`/MT`), so the exe runs on a bare Windows 10 1809+.
 - Pure logic goes in `core.c` with a test in `tests/test_core.c`; the pin
-  entry helpers are tested in `tests/test_pin.c`. A new fact about how Claude
+  helpers are tested in `tests/test_pin.c`. A new fact about how Claude
   works gets a check in `tests/test_claude.c`.
 - Every look comes from `theme.c`: colors (`Theme_Color`, the main, bright and
-  pale blues of a list row), fonts (`Theme_CreateFonts`), rows (`Theme_DrawRow`),
-  buttons and drop-downs (`Theme_DrawButton`, `Theme_DrawDropDown`, `Theme_SetStrong`), off-screen
+  pale blues of a list row, `THEME_SEPARATOR`), fonts (`Theme_CreateFonts`), rows (`Theme_DrawRow`),
+  tree arrows (`Theme_DrawTreeGlyph`), buttons and drop-downs (`Theme_DrawButton`, `Theme_DrawDropDown`,
+  `Theme_DropDownWidth`, `Theme_SetStrong`), off-screen
   drawing (`Theme_BufferBegin`); every list, list box and tree scrolls by the
   pixel in a smooth view (`Theme_SmoothView`), as what the program draws does.
-  Every dialog opens through `Ui_Dialog`, which
+  Every dialog but the manager window itself opens through `Ui_Dialog`, which
   centers it on its owner and themes its controls (`Theme_Apply`); its own
   procedure only fills it. Nothing else picks a color, draws a selection or
   places a dialog; a new kind of control is themed there, and
   `tests/test_theme.c` compares it with Windows.
-- User-visible text is English and plain; comments explain why, not history.
+- User-visible text is plain English in `TR(L"...")` or `app.rc`, with a row for all twelve
+  languages in `localize_catalog.inc` (kept sorted); `test_localize` and
+  `tools/check-localization.py` check it. A key the code reaches through a variable is listed
+  in the checker. English uses "…" (`\x2026` in `app.rc`, which stays ASCII); zh, hi, bn and ur
+  put access keys after the text as "(&X)"; text naming Claude's interface uses Claude's own
+  words. Comments explain why, not history.
+- Tests never touch the user's real state: private folders (`Util_SetStateDir` for the log and
+  queued session changes), private registry keys, throwaway profiles.
 
 ## Build and test
 
@@ -122,8 +105,9 @@ docs/               HOW-IT-WORKS.md (technical doc) and screenshot.png (README i
 build.cmd
 ```
 
-Builds `build\ClaudeDesktopProfilesManager.exe` and runs `build\test\test_core.exe`,
-`build\test\test_pin.exe`, `build\test\test_theme.exe` and `build\test\test_claude.exe` (skipped without Claude). Manual
+Builds `build\ClaudeDesktopProfilesManager.exe` and runs the nine test programs of `tests\`; the exe
+is put in `build\` only once they all pass (`test_claude` is skipped without Claude; `test_theme` and
+`test_layout` show windows and check what is drawn, so they need an unlocked desktop session). Manual
 checks on a real machine: install (`build\ClaudeDesktopProfilesManager.exe --install`), create
 a throwaway profile, open it, create and detect a desktop shortcut, sign in with
 two profiles open and read `%LOCALAPPDATA%\Claude Desktop Profiles Manager\claude-desktop-profiles-manager.log`,

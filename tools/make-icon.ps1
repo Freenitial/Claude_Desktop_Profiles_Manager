@@ -3,11 +3,17 @@
     Regenerates src\app.ico, the Claude Desktop Profiles Manager application icon.
 
 .DESCRIPTION
-    Draws the icon with System.Drawing at every size Windows asks for and packs
-    the PNG renders into a single .ico. Run it with Windows PowerShell 5.1
-    (System.Drawing ships with the .NET Framework):
+    Draws the icon with System.Drawing at the sizes Windows asks for at every
+    scale from 100 % to 300 % of small icons, taskbar buttons and large icons,
+    and 256 for Explorer's largest views (the sizes of the profile icons in
+    src\icons.c), and packs the PNG renders into a single .ico. Run it with
+    Windows PowerShell 5.1 (System.Drawing ships with the .NET Framework):
 
         powershell -NoProfile -ExecutionPolicy Bypass -File tools\make-icon.ps1
+
+.PARAMETER OutFile
+    The .ico to write (default: src\app.ico). A relative path is relative to
+    the current PowerShell location.
 #>
 [CmdletBinding()]
 param(
@@ -16,73 +22,95 @@ param(
 
 $ErrorActionPreference = 'Stop'
 if (-not $OutFile) {
-    $OutFile = Join-Path (Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)) 'src\app.ico'
+    $OutFile = Join-Path (Split-Path -Parent $PSScriptRoot) 'src\app.ico'
 }
+# .NET resolves a relative path against the process's directory, not the PowerShell location.
+$OutFile = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutFile)
 Add-Type -AssemblyName System.Drawing
 
-function New-RoundedRect([single]$x, [single]$y, [single]$w, [single]$h, [single]$r) {
-    $p = New-Object System.Drawing.Drawing2D.GraphicsPath
-    $d = 2 * $r
-    $p.AddArc($x, $y, $d, $d, 180, 90)
-    $p.AddArc($x + $w - $d, $y, $d, $d, 270, 90)
-    $p.AddArc($x + $w - $d, $y + $h - $d, $d, $d, 0, 90)
-    $p.AddArc($x, $y + $h - $d, $d, $d, 90, 90)
-    $p.CloseFigure()
-    return $p
+function New-RoundedRectangle([single]$Left, [single]$Top, [single]$Width, [single]$Height, [single]$Radius) {
+    $outline = New-Object System.Drawing.Drawing2D.GraphicsPath
+    $diameter = 2 * $Radius
+    $outline.AddArc($Left, $Top, $diameter, $diameter, 180, 90)
+    $outline.AddArc($Left + $Width - $diameter, $Top, $diameter, $diameter, 270, 90)
+    $outline.AddArc($Left + $Width - $diameter, $Top + $Height - $diameter, $diameter, $diameter, 0, 90)
+    $outline.AddArc($Left, $Top + $Height - $diameter, $diameter, $diameter, 90, 90)
+    $outline.CloseFigure()
+    return $outline
 }
 
-function Add-Person($g, [single]$cx, [single]$top, [single]$scale, $brush) {
-    $head = 0.30 * $scale
-    $g.FillEllipse($brush, $cx - $head / 2, $top, $head, $head)
-    $bodyW = 0.56 * $scale
-    $bodyH = 0.30 * $scale
-    $bodyTop = $top + $head + 0.05 * $scale
-    $body = New-RoundedRect ($cx - $bodyW / 2) $bodyTop $bodyW $bodyH (0.14 * $scale)
-    $g.FillPath($brush, $body)
-    $body.Dispose()
+function Add-Person($Graphics, [single]$CenterX, [single]$Top, [single]$Scale, $Brush) {
+    $headSize = 0.30 * $Scale
+    $Graphics.FillEllipse($Brush, $CenterX - $headSize / 2, $Top, $headSize, $headSize)
+    $bodyWidth = 0.56 * $Scale
+    $bodyHeight = 0.30 * $Scale
+    $bodyTop = $Top + $headSize + 0.05 * $Scale
+    $body = New-RoundedRectangle ($CenterX - $bodyWidth / 2) $bodyTop $bodyWidth $bodyHeight (0.14 * $Scale)
+    try {
+        $Graphics.FillPath($Brush, $body)
+    } finally {
+        $body.Dispose()
+    }
 }
 
-function Render([int]$s) {
-    $bmp = New-Object System.Drawing.Bitmap $s, $s, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = 'AntiAlias'
-    $g.PixelOffsetMode = 'HighQuality'
-    $g.Clear([System.Drawing.Color]::Transparent)
-
-    $m = [single]($s * 0.04)
-    $bg = New-RoundedRect $m $m ($s - 2 * $m) ($s - 2 * $m) ([single]($s * 0.22))
-    $grad = New-Object System.Drawing.Drawing2D.LinearGradientBrush (
-        (New-Object System.Drawing.PointF 0, 0), (New-Object System.Drawing.PointF $s, $s),
-        [System.Drawing.Color]::FromArgb(255, 109, 91, 245), [System.Drawing.Color]::FromArgb(255, 55, 48, 163))
-    $g.FillPath($grad, $bg)
-
-    $back = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 255, 255, 255))
-    $front = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
-    Add-Person $g ([single]($s * 0.63)) ([single]($s * 0.20)) ([single]($s * 0.62)) $back
-    Add-Person $g ([single]($s * 0.40)) ([single]($s * 0.31)) ([single]($s * 0.70)) $front
-
-    $g.Dispose(); $grad.Dispose(); $back.Dispose(); $front.Dispose(); $bg.Dispose()
-    $ms = New-Object System.IO.MemoryStream
-    $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-    $bmp.Dispose()
-    return , $ms.ToArray()
+# The icon at Size x Size, as PNG bytes. Every object is disposed, whichever
+# constructor throws.
+function Get-IconPng([int]$Size) {
+    $bitmap = $graphics = $background = $gradient = $backPerson = $frontPerson = $png = $null
+    try {
+        $bitmap = New-Object System.Drawing.Bitmap $Size, $Size, ([System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        $margin = [single]($Size * 0.04)
+        $background = New-RoundedRectangle $margin $margin ($Size - 2 * $margin) ($Size - 2 * $margin) ([single]($Size * 0.22))
+        $gradient = New-Object System.Drawing.Drawing2D.LinearGradientBrush (
+            (New-Object System.Drawing.PointF 0, 0), (New-Object System.Drawing.PointF $Size, $Size),
+            [System.Drawing.Color]::FromArgb(255, 109, 91, 245), [System.Drawing.Color]::FromArgb(255, 55, 48, 163))
+        $backPerson = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(150, 255, 255, 255))
+        $frontPerson = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(255, 255, 255, 255))
+        $graphics.SmoothingMode = 'AntiAlias'
+        $graphics.PixelOffsetMode = 'HighQuality'
+        $graphics.Clear([System.Drawing.Color]::Transparent)
+        $graphics.FillPath($gradient, $background)
+        Add-Person $graphics ([single]($Size * 0.63)) ([single]($Size * 0.20)) ([single]($Size * 0.62)) $backPerson
+        Add-Person $graphics ([single]($Size * 0.40)) ([single]($Size * 0.31)) ([single]($Size * 0.70)) $frontPerson
+        # The drawing is complete in the bitmap once its Graphics is gone.
+        $graphics.Dispose()
+        $graphics = $null
+        $png = New-Object System.IO.MemoryStream
+        $bitmap.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+        return , $png.ToArray()
+    } finally {
+        foreach ($owned in $png, $frontPerson, $backPerson, $gradient, $background, $graphics, $bitmap) {
+            if ($null -ne $owned) {
+                $owned.Dispose()
+            }
+        }
+    }
 }
 
-$sizes = 16, 20, 24, 32, 40, 48, 64, 256
-$images = foreach ($s in $sizes) { , (Render $s) }
+$sizes = 16, 20, 24, 28, 30, 32, 36, 40, 42, 48, 54, 56, 60, 64, 72, 80, 96, 256
+$pngImages = foreach ($size in $sizes) { , (Get-IconPng $size) }
 
-$out = New-Object System.IO.MemoryStream
-$w = New-Object System.IO.BinaryWriter $out
-$w.Write([uint16]0); $w.Write([uint16]1); $w.Write([uint16]$sizes.Count)
-$offset = 6 + 16 * $sizes.Count
-for ($i = 0; $i -lt $sizes.Count; $i++) {
-    $dim = if ($sizes[$i] -ge 256) { 0 } else { $sizes[$i] }
-    $w.Write([byte]$dim); $w.Write([byte]$dim); $w.Write([byte]0); $w.Write([byte]0)
-    $w.Write([uint16]1); $w.Write([uint16]32)
-    $w.Write([uint32]$images[$i].Length); $w.Write([uint32]$offset)
-    $offset += $images[$i].Length
+$ico = New-Object System.IO.MemoryStream
+$writer = New-Object System.IO.BinaryWriter $ico
+try {
+    # The ICONDIR header, one ICONDIRENTRY per size, then the PNGs in the same order.
+    $writer.Write([uint16]0); $writer.Write([uint16]1); $writer.Write([uint16]$sizes.Count)
+    $offset = 6 + 16 * $sizes.Count
+    for ($i = 0; $i -lt $sizes.Count; $i++) {
+        $dimension = $sizes[$i]
+        if ($dimension -ge 256) {
+            $dimension = 0
+        }
+        $writer.Write([byte]$dimension); $writer.Write([byte]$dimension); $writer.Write([byte]0); $writer.Write([byte]0)
+        $writer.Write([uint16]1); $writer.Write([uint16]32)
+        $writer.Write([uint32]$pngImages[$i].Length); $writer.Write([uint32]$offset)
+        $offset += $pngImages[$i].Length
+    }
+    foreach ($image in $pngImages) { $writer.Write($image) }
+    $writer.Flush()
+    [IO.File]::WriteAllBytes($OutFile, $ico.ToArray())
+} finally {
+    $writer.Dispose()   # closes $ico too
 }
-foreach ($img in $images) { $w.Write($img) }
-$w.Flush()
-[IO.File]::WriteAllBytes($OutFile, $out.ToArray())
 Write-Host "Wrote $OutFile"

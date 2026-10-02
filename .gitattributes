@@ -1,17 +1,21 @@
 # Normalize text files; pin Windows-native endings where it matters.
 * text=auto
 
-# cmd is the only interpreter that can be picky about line endings: pin CRLF.
+# cmd mis-reads labels (goto, call :label) in batch files without CRLF: pin it.
 *.bat text eol=crlf
 *.cmd text eol=crlf
-*.ps1 text eol=crlf
 
-# Sources and docs
+# Sources, tools and docs
 *.c        text
 *.h        text
+*.inc      text
 *.manifest text
 *.md       text
+*.py       text
 *.yml      text
+
+# Windows PowerShell 5.1 accepts LF or CRLF, but reads a script without BOM in the ANSI code page: keep scripts ASCII.
+*.ps1      text
 
 # app.rc is ASCII. If it is ever saved as UTF-16, change this line to: *.rc -text
 *.rc       text
@@ -19,4 +23,3 @@
 # Binary assets
 *.ico binary
 *.png binary
-*.gif binary
